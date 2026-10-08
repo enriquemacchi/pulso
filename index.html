@@ -79,6 +79,10 @@ h1.title{font-family:"Newsreader",Georgia,serif;font-weight:500;font-size:34px;l
 .big{font-family:"Newsreader",Georgia,serif;font-weight:500;font-size:clamp(42px,13vw,60px);letter-spacing:-.025em;line-height:1.02;margin:4px 0 16px}
 .split{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
 .split small{display:block;font-size:12px;color:var(--ink-3);margin-top:1px}
+.hero-card{margin-top:18px;padding-top:14px;border-top:1px solid var(--rule)}
+.hero-card .mid{font-family:"Newsreader",Georgia,serif;font-weight:500;font-size:clamp(30px,9vw,40px);letter-spacing:-.02em;line-height:1.05;margin:2px 0 6px}
+.breakdown{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:13px;color:var(--ink-2);margin:0}
+.breakdown b{font-weight:600;color:var(--ink)}
 .rate-line{display:flex;align-items:center;gap:10px;margin:14px 0 0;font-size:14px;color:var(--ink-2)}
 .item .rate-in{max-width:42%;text-align:right;padding:8px 10px;font-size:16px}
 .seg.four button{padding:8px 4px;font-size:13px}
@@ -283,6 +287,14 @@ const MESES = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto"
 const MESES_C = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"];
 const DIAS = ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];
 const PALETTE = ["#3E8A5B","#B5603A","#2F6F8F","#6B5BA8","#C08A2E","#4F7C7A","#A2456B","#8A6F4E","#5C6F9E","#9B4A3C","#1E6A4C","#7D8794"];
+const USES = {libre:"Disponible", tarjeta:"Para pagar la tarjeta", "":"No mostrar"};
+function accUse(a){
+  if (a.use != null) return a.use;
+  if (a.kind === "objetivo") return "";
+  if (/personal\s*pay/i.test(a.name)) return "tarjeta";
+  if ((a.currency || BASE()) === BASE() && (a.kind === "efectivo" || /galicia/i.test(a.name))) return "libre";
+  return "";
+}
 const KINDS = {efectivo:"Efectivo", banco:"Banco", tarjeta:"Tarjeta", inversion:"Inversión", objetivo:"Objetivo"};
 
 const ICONS = {
@@ -735,18 +747,14 @@ function viewInicio(){
   const noMovs = allMovs().length === 0;
 
   let h = '<header class="top"><div class="brand">Pulso</div>' + syncBadge() + '</header>';
-  h += '<section class="hero"><div class="hero-label">Tu patrimonio <button class="iconbtn" data-a="toggle-hide" aria-label="' + (prefs.hidden ? "Mostrar importes" : "Ocultar importes") + '">' + ic(prefs.hidden ? "eyeoff" : "eye", 20) + '</button></div>' +
-    '<div class="big amt">' + money(enCuentas + enObj) + '</div>' +
-    '<div class="split">' + (fcs.length
-      ? '<div><span>En ' + curPlural(BASE()) + '</span><b class="amt">' + money(sum(S.config.accounts.filter(a => a.currency === BASE()).map(a => bal[a.id] || 0))) + '</b></div>' +
-        fcs.map(c => { const tot = sum(S.config.accounts.filter(a => a.currency === c).map(a => bal[a.id] || 0));
-          return '<div><span>En ' + curPlural(c) + '</span><b class="amt">' + money(tot, false, c) + '</b><small>' + (rateOf(c) ? "≈ " + money(toBase(tot, c)) : "Sin cotización") + '</small></div>'; }).join("")
-      : '<div><span>En cuentas</span><b class="amt">' + money(enCuentas) + '</b></div><div><span>En objetivos</span><b class="amt">' + money(enObj) + '</b></div>') + '</div>' +
-    (fcs.length ? '<p class="rate-line">' + fcs.map(c => cap(curInfo(c)[0].toLowerCase()) + " de referencia: " + (rateOf(c) ? "<b>" + fmtNum(rateOf(c)) + "</b>" : "sin cargar")).join(". ") + ' <button class="link" data-a="goto-ajustes">Cambiar</button></p>' : "") +
+  const libres = accs.filter(a => accUse(a) === "libre"), tarjs = accs.filter(a => accUse(a) === "tarjeta");
+  const totOf = list => sum(list.map(a => toBase(bal[a.id] || 0, a.currency)));
+  const brk = list => list.length > 1 ? '<p class="breakdown">' + list.map(a => '<span>' + esc(a.name) + ' <b class="amt">' + money(bal[a.id] || 0, false, a.currency) + '</b></span>').join("") + '</p>' : "";
+  h += '<section class="hero"><div class="hero-label">Disponible <button class="iconbtn" data-a="toggle-hide" aria-label="' + (prefs.hidden ? "Mostrar importes" : "Ocultar importes") + '">' + ic(prefs.hidden ? "eyeoff" : "eye", 20) + '</button></div>' +
+    '<div class="big amt" style="margin-bottom:8px">' + money(totOf(libres)) + '</div>' +
+    (libres.length ? brk(libres) : '<p class="breakdown">Elegí qué cuentas suman acá desde Ajustes → cuenta → “Mostrar en inicio”.</p>') +
+    (tarjs.length ? '<div class="hero-card"><div class="hero-label">Para pagar la tarjeta</div><div class="mid amt">' + money(totOf(tarjs)) + '</div>' + brk(tarjs) + '</div>' : "") +
     '</section>';
-  const missing = fcs.filter(c => !rateOf(c));
-  if (missing.length) h += '<div class="notice"><p>Cargá la cotización del ' + missing.map(c => curInfo(c)[0].toLowerCase()).join(" y del ") + ' para sumar esas cuentas a tu patrimonio.</p><button class="btn small" data-a="goto-ajustes">Cargar</button></div>';
-
   if (IS_IOS && !STANDALONE && !prefs.hideInstall) {
     h += '<div class="notice" style="align-items:flex-start"><p><b>Instalala en tu inicio</b><br>Tocá Compartir y elegí “Agregar a inicio”. Cargá tus datos desde el ícono: Safari los guarda por separado.</p><button class="x" data-a="dismiss-install" aria-label="Cerrar aviso">' + ic("x", 16) + '</button></div>';
   }
@@ -880,11 +888,34 @@ function deltaHtml(cur, prev, goodWhenDown){
   return '<span class="delta ' + (good ? "pos" : "neg") + '">' + (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(Math.round(d * 100)) + '%</span>';
 }
 
+function anPatrimonio(){
+  const bal = balances();
+  const accs = S.config.accounts.filter(a => a.kind !== "objetivo");
+  const goals = S.config.accounts.filter(a => a.kind === "objetivo");
+  const fcs = foreignCurs();
+  const enCuentas = sum(accs.map(a => toBase(bal[a.id] || 0, a.currency))), enObj = sum(goals.map(a => toBase(bal[a.id] || 0, a.currency)));
+  let h = '';
+  h += '<section class="hero" style="padding-top:4px"><div class="hero-label" style="padding-top:0">Tu patrimonio <button class="iconbtn" data-a="toggle-hide" aria-label="' + (prefs.hidden ? "Mostrar importes" : "Ocultar importes") + '">' + ic(prefs.hidden ? "eyeoff" : "eye", 20) + '</button></div>' +
+    '<div class="big amt">' + money(enCuentas + enObj) + '</div>' +
+    '<div class="split">' + (fcs.length
+      ? '<div><span>En ' + curPlural(BASE()) + '</span><b class="amt">' + money(sum(S.config.accounts.filter(a => a.currency === BASE()).map(a => bal[a.id] || 0))) + '</b></div>' +
+        fcs.map(c => { const tot = sum(S.config.accounts.filter(a => a.currency === c).map(a => bal[a.id] || 0));
+          return '<div><span>En ' + curPlural(c) + '</span><b class="amt">' + money(tot, false, c) + '</b><small>' + (rateOf(c) ? "≈ " + money(toBase(tot, c)) : "Sin cotización") + '</small></div>'; }).join("")
+      : '<div><span>En cuentas</span><b class="amt">' + money(enCuentas) + '</b></div><div><span>En objetivos</span><b class="amt">' + money(enObj) + '</b></div>') + '</div>' +
+    (fcs.length ? '<p class="rate-line">' + fcs.map(c => cap(curInfo(c)[0].toLowerCase()) + " de referencia: " + (rateOf(c) ? "<b>" + fmtNum(rateOf(c)) + "</b>" : "sin cargar")).join(". ") + ' <button class="link" data-a="goto-ajustes">Cambiar</button></p>' : "") +
+    '</section>';
+  const missing = fcs.filter(c => !rateOf(c));
+  if (missing.length) h += '<div class="notice"><p>Cargá la cotización del ' + missing.map(c => curInfo(c)[0].toLowerCase()).join(" y del ") + ' para sumar esas cuentas a tu patrimonio.</p><button class="btn small" data-a="goto-ajustes">Cargar</button></div>';
+  h += '<div class="sec"><h2>Por cuenta</h2></div><div class="ledger">' + S.config.accounts.map(a => '<button class="row" data-a="acc-movs" data-id="' + esc(a.id) + '"><span class="dot sq" style="background:var(--ink-2)"></span><span class="t"><b>' + esc(a.name) + '</b><span class="meta"><span>' + esc(KINDS[a.kind] || "Cuenta") + '</span></span></span><span class="r"><b class="amt ' + (bal[a.id] < 0 ? "neg" : "") + '">' + money(bal[a.id] || 0, false, a.currency) + '</b>' + (a.currency !== BASE() && rateOf(a.currency) ? '<small>≈ ' + money(toBase(bal[a.id] || 0, a.currency)) + '</small>' : "") + '</span></button>').join("") + '</div>';
+  return h;
+}
+
 function viewAnalisis(){
   let h = '<header class="top"><h1 class="title" style="margin:6px 0 4px">Análisis</h1>' + syncBadge() + '</header>';
-  h += '<div class="seg" style="margin-bottom:14px">' + [["resumen","Resumen"],["historico","Histórico"],["comparar","Comparar"]].map(x => '<button class="' + (UI.anTab === x[0] ? "on" : "") + '" data-a="an-tab" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>';
+  h += '<div class="seg four" style="margin-bottom:14px">' + [["resumen","Resumen"],["historico","Histórico"],["comparar","Comparar"],["patrimonio","Patrimonio"]].map(x => '<button class="' + (UI.anTab === x[0] ? "on" : "") + '" data-a="an-tab" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>';
   if (UI.anTab === "resumen") h += anResumen();
   else if (UI.anTab === "historico") h += anHistorico();
+  else if (UI.anTab === "patrimonio") h += anPatrimonio();
   else h += anComparar();
   return h;
 }
@@ -1126,7 +1157,7 @@ function openMovForm(m, preset){
 function syncDraft(){
   const g = id => { const el = $("#" + id); return el ? el.value : null; };
   if (!D) return;
-  const map = {"f-amt":"amountText", "f-concept":"concept", "f-date":"date", "f-acc":"acc", "f-to":"to", "f-name":"name", "f-kind":"kind",
+  const map = {"f-amt":"amountText", "f-concept":"concept", "f-date":"date", "f-acc":"acc", "f-to":"to", "f-name":"name", "f-kind":"kind", "f-use":"use",
     "f-initial":"initialText", "f-target":"targetText", "f-cur":"currency", "f-rate":"rateText", "f-fxamt":"fxText", "f-baseamt":"baseText", "f-base":"baseAcc", "f-fx":"fxAcc", "f-surl":"surl", "f-skey":"skey"};
   Object.keys(map).forEach(id => { const v = g(id); if (v != null) D[map[id]] = v; });
 }
@@ -1253,6 +1284,7 @@ function accForm(){
     (used ? '<small class="muted" style="display:block;margin-top:6px;font-size:13px">No se puede cambiar porque ya tiene movimientos.</small>' : "") + '</div>';
   if (cur !== BASE()) h += '<div class="field"><label for="f-rate">Cotización de referencia (' + curSym(BASE()) + ' por ' + curSym(cur) + ')</label><input id="f-rate" class="input" inputmode="decimal" placeholder="Por ejemplo, 1.250" value="' + esc(D.rateText || "") + '"><small class="muted" style="display:block;margin-top:6px;font-size:13px">Para sumar esta cuenta a tu patrimonio en ' + curPlural(BASE()) + '. Se actualiza sola cuando registrás un cambio.</small></div>';
   if (!g) h += '<div class="field"><label for="f-kind">Tipo</label><select id="f-kind" class="input">' + ["efectivo","banco","tarjeta","inversion"].map(k => '<option value="' + k + '"' + (D.kind === k ? " selected" : "") + '>' + KINDS[k] + '</option>').join("") + '</select></div>';
+  if (!g) h += '<div class="field"><label for="f-use">Mostrar en inicio</label><select id="f-use" class="input">' + Object.keys(USES).map(k => '<option value="' + k + '"' + (accUse(D) === k ? " selected" : "") + '>' + USES[k] + '</option>').join("") + '</select><small class="muted" style="display:block;margin-top:6px;font-size:13px">“Disponible” es la plata para todo concepto; “Para pagar la tarjeta” se muestra aparte.</small></div>';
   else h += '<div class="field"><label for="f-target">Meta</label><input id="f-target" class="input" inputmode="decimal" placeholder="0,00" value="' + esc(D.targetText) + '"></div>';
   h += '<div class="field"><label for="f-initial">' + (g ? "Ya ahorrado" : "Saldo inicial") + (cur !== BASE() ? " en " + curPlural(cur) : "") + '</label><input id="f-initial" class="input" inputmode="decimal" placeholder="0,00" value="' + esc(D.initialText) + '"><small class="muted" style="display:block;margin-top:6px;font-size:13px">' + (g ? "Lo que ya tenés guardado para este objetivo. Los aportes se suman como transferencias." : "Lo que había en la cuenta antes de tu primer movimiento. Para una tarjeta con deuda, usá un número negativo.") + '</small></div>';
   h += '<div class="err" id="f-err"></div><div class="actions">';
@@ -1268,6 +1300,7 @@ function saveAcc(){
   if (isNaN(initial)) return formError("Revisá el saldo: usá solo números.");
   if (/^\s*[-−]/.test(D.initialText)) initial = -Math.abs(initial);
   const acc = { id:D.id || newId(), name, kind:D.kind, currency:D.currency || BASE(), initial:round2(initial) };
+  if (D.kind !== "objetivo") acc.use = D.use != null ? D.use : accUse(acc);
   if (acc.currency !== BASE()) { const r = parseAmount(D.rateText); if (r > 0) S.config.settings.rates[acc.currency] = Math.round(r * 10000) / 10000; }
   if (D.kind === "objetivo") {
     const target = parseAmount(D.targetText);
