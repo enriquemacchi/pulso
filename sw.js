@@ -1,5 +1,5 @@
 // Pulso: permite abrir la app sin conexión. Tus datos no pasan por acá; quedan en el teléfono.
-const CACHE = "pulso-v2";
+const CACHE = "pulso-v3";
 const ARCHIVOS = ["./", "./index.html", "./manifest.webmanifest", "./icon-180.png", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {

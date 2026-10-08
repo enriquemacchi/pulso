@@ -315,7 +315,7 @@ applyTheme();
 
 /* ---------- datos ---------- */
 function defaults(){
-  return {
+  const d = {
     v:1,
     accounts:[
       {id:"efectivo", name:"Efectivo", kind:"efectivo", initial:0},
@@ -340,6 +340,8 @@ function defaults(){
     recurrentes:[],
     settings:{currency:"ARS", monthStart:1, rates:{}}
   };
+  d.accounts.forEach(x => x.u = 0); d.categories.forEach(x => x.u = 0); d.settings.u = 0;
+  return d;
 }
 function normalize(c){
   const d = defaults();
@@ -354,7 +356,7 @@ function normalize(c){
   return c;
 }
 
-const S = { config: defaults(), months: {} };
+const S = { config: defaults(), months: {}, tomb: {} };
 const UI = { tab:"inicio", movOffset:0, movMode:"lista", movFilter:"todos", movAcc:null, q:"", calSel:null,
              anTab:"resumen", anRange:"mes", anOffset:0, histYear:new Date().getFullYear(), cmpDays:14 };
 
@@ -453,28 +455,209 @@ function parseAmount(t){
 const toInput = n => (n == null || n === "") ? "" : String(n).replace(".", ",");
 
 /* ---------- guardado en este dispositivo ---------- */
-const DATA_KEY = "pulso:data";
+const DATA_KEY = "pulso:data", SYNC_KEY = "pulso:sync";
 const Sync = { mode:"loading" };
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const IS_MOBILE = IS_IOS || /Android/i.test(navigator.userAgent);
 const STANDALONE = window.navigator.standalone === true || !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
 function readLocal(){ try { const r = localStorage.getItem(DATA_KEY); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
 let saveFailed = false;
-function saveLocal(){
-  try { localStorage.setItem(DATA_KEY, JSON.stringify({v:1, config:S.config, months:S.months})); saveFailed = false; }
+function writeLocal(){
+  try { localStorage.setItem(DATA_KEY, JSON.stringify({v:2, config:S.config, months:S.months, tomb:S.tomb})); saveFailed = false; }
   catch (e) { if (!saveFailed) toast("No se pudo guardar. Liberá espacio en el teléfono y exportá una copia."); saveFailed = true; }
+}
+function fmtDate(s){ const d = new Date(s); return isNaN(d) ? "fecha desconocida" : d.getDate() + " " + MESES_C[d.getMonth()] + " " + d.getFullYear(); }
+
+/* Cada cosa guardada lleva la hora de su último cambio ("u") y lo borrado queda anotado en S.tomb,
+   así dos dispositivos pueden combinar sus datos sin pisarse. */
+let SNAP = {};
+const recSig = x => { const c = Object.assign({}, x); delete c.u; return JSON.stringify(c); };
+function eachRec(fn){
+  S.config.accounts.forEach(x => fn("a", x));
+  S.config.categories.forEach(x => fn("c", x));
+  S.config.recurrentes.forEach(x => fn("r", x));
+  allMovs().forEach(x => fn("m", x));
+}
+function baseline(){
+  SNAP = {};
+  if (!S.tomb) S.tomb = {};
+  eachRec((k, x) => { if (x.u == null) x.u = 1; SNAP[k + ":" + x.id] = [recSig(x), x.u]; });
+  if (S.config.settings.u == null) S.config.settings.u = 1;
+  SNAP["s:"] = [recSig(S.config.settings), S.config.settings.u];
+}
+function stamp(){
+  const now = Date.now(), seen = {};
+  let changed = false;
+  if (!S.tomb) S.tomb = {};
+  eachRec((k, x) => {
+    const key = k + ":" + x.id, sig = recSig(x), prev = SNAP[key];
+    seen[key] = 1;
+    if (!prev || prev[0] !== sig) { x.u = now; SNAP[key] = [sig, now]; delete S.tomb[key]; changed = true; }
+    else if (x.u == null) x.u = prev[1];
+  });
+  Object.keys(SNAP).forEach(key => { if (key !== "s:" && !seen[key]) { S.tomb[key] = now; delete SNAP[key]; changed = true; } });
+  const st = S.config.settings, sig = recSig(st), prev = SNAP["s:"];
+  if (!prev || prev[0] !== sig) { st.u = now; SNAP["s:"] = [sig, now]; changed = true; }
+  else if (st.u == null) st.u = prev[1];
+  return changed;
+}
+function saveLocal(){
+  if (stamp()) { SY.gen++; scheduleSync(); }
+  writeLocal();
 }
 const persistConfig = () => saveLocal();
 const persistMonth = () => saveLocal();
-function syncBadge(){ return ""; }
-function fmtDate(s){ const d = new Date(s); return isNaN(d) ? "fecha desconocida" : d.getDate() + " " + MESES_C[d.getMonth()] + " " + d.getFullYear(); }
+
+// Combina dos copias de los datos. Gana la versión más reciente de cada cosa
+// (cuenta, categoría, movimiento mensual, movimiento). Lo borrado queda anotado
+// para que no vuelva a aparecer desde el otro dispositivo.
+function combinar(a, b) {
+  a = a || {}; b = b || {};
+  const LIMITE = Date.now() - 400 * 864e5;
+  const tomb = {};
+  [a.tomb || {}, b.tomb || {}].forEach(t => Object.keys(t).forEach(k => {
+    if (t[k] >= LIMITE && !(tomb[k] >= t[k])) tomb[k] = t[k];
+  }));
+  const lista = (tipo, la, lb) => {
+    const porId = {}, orden = [];
+    (la || []).forEach(x => { if (x && x.id != null && !porId[x.id]) { porId[x.id] = x; orden.push(x.id); } });
+    (lb || []).forEach(y => {
+      if (!y || y.id == null) return;
+      const x = porId[y.id];
+      if (!x) { porId[y.id] = y; orden.push(y.id); }
+      else if ((y.u || 0) > (x.u || 0)) porId[y.id] = y;
+    });
+    return orden.map(id => porId[id]).filter(x => !(tomb[tipo + ":" + x.id] >= (x.u || 0)));
+  };
+  const sa = a.settings && Object.keys(a.settings).length ? a.settings : null;
+  const sb = b.settings && Object.keys(b.settings).length ? b.settings : null;
+  const settings = !sa ? sb : !sb ? sa : ((sb.u || 0) > (sa.u || 0) ? sb : sa);
+  return {
+    v: 2,
+    accounts: lista("a", a.accounts, b.accounts),
+    categories: lista("c", a.categories, b.categories),
+    recurrentes: lista("r", a.recurrentes, b.recurrentes),
+    movs: lista("m", a.movs, b.movs),
+    settings: settings || {},
+    tomb: tomb
+  };
+}
+
+/* ---------- sincronización con Google (opcional) ---------- */
+const SY = { busy:false, again:false, gen:0, state:"", timer:null, lastTry:0 };
+function syncCfg(){ try { const c = JSON.parse(localStorage.getItem(SYNC_KEY) || "null"); return c && c.url && c.key ? c : null; } catch (e) { return null; } }
+function setSyncCfg(c){ try { if (c) localStorage.setItem(SYNC_KEY, JSON.stringify(c)); else localStorage.removeItem(SYNC_KEY); } catch (e) {} }
+function haceTxt(t){
+  const s = Math.round((Date.now() - t) / 1000);
+  if (s < 60) return "recién";
+  const m = Math.round(s / 60); if (m < 60) return "hace " + m + " min";
+  const h = Math.round(m / 60); if (h < 24) return "hace " + h + " h";
+  return "el " + fmtDate(new Date(t).toISOString());
+}
+function syncStatusText(){
+  const c = syncCfg(); if (!c) return "";
+  const msg = { syncing:"Sincronizando…", offline:"Sin conexión. Se sincroniza cuando vuelva internet.",
+    error:"No se pudo sincronizar. Se vuelve a intentar sola en unos minutos.",
+    clave:"La clave no coincide con la del script. Desconectá este dispositivo y volvé a conectarlo con la clave correcta." };
+  if (msg[SY.state]) return msg[SY.state];
+  return c.last ? "Última sincronización: " + haceTxt(c.last) + "." : "Todavía no sincronizó.";
+}
+function syncBadge(){
+  if (!syncCfg()) return "";
+  const map = { ok:["ok","Sincronizado"], syncing:["saving","Sincronizando…"], offline:["","Sin conexión"], error:["err","Sin sincronizar"], clave:["err","Revisá la clave"] };
+  const v = map[SY.state] || ["", "Google"];
+  return '<button class="sync ' + v[0] + '" data-a="sync-now" aria-label="Sincronizar ahora"><i></i>' + v[1] + '</button>';
+}
+function setSyncState(st){
+  SY.state = st;
+  $$(".sync").forEach(el => { el.outerHTML = syncBadge(); });
+  const s = $("#sync-status"); if (s) s.textContent = syncStatusText();
+}
+function scheduleSync(){ if (!syncCfg()) return; clearTimeout(SY.timer); SY.timer = setTimeout(syncNow, 1500); }
+async function callScript(url, body){
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const t = setTimeout(() => { if (ctrl) ctrl.abort(); }, 30000);
+  try {
+    const r = await fetch(url, { method:"POST", body:JSON.stringify(body), redirect:"follow", signal:ctrl ? ctrl.signal : undefined });
+    const txt = await r.text();
+    try { return JSON.parse(txt); } catch (e) { throw { code:"respuesta" }; }
+  } finally { clearTimeout(t); }
+}
+function toDoc(){
+  return { v:2, accounts:S.config.accounts, categories:S.config.categories, recurrentes:S.config.recurrentes,
+    settings:S.config.settings, movs:allMovs(), tomb:S.tomb || {} };
+}
+function applyDoc(d){
+  const cfg = normalize({ accounts:d.accounts || [], categories:d.categories || [], recurrentes:d.recurrentes || [],
+    settings: d.settings && Object.keys(d.settings).length ? d.settings : S.config.settings });
+  const months = {};
+  (d.movs || []).forEach(m => { if (m && typeof m.date === "string") { const k = m.date.slice(0, 7); (months[k] = months[k] || []).push(m); } });
+  S.config = cfg; S.months = months; S.tomb = d.tomb || {};
+  baseline(); writeLocal();
+}
+async function syncNow(){
+  const c = syncCfg(); if (!c) return;
+  clearTimeout(SY.timer);
+  if (SY.busy) { SY.again = true; return; }
+  SY.lastTry = Date.now();
+  if (navigator.onLine === false) { setSyncState("offline"); return; }
+  SY.busy = true; SY.again = false; setSyncState("syncing");
+  const gen = SY.gen; let ok = false;
+  try {
+    const before = JSON.stringify(toDoc());
+    const j = await callScript(c.url, { accion:"sync", clave:c.key, datos:toDoc() });
+    if (!j || !j.ok) throw { code:(j && j.error) || "respuesta" };
+    if (stamp()) SY.gen++;
+    applyDoc(combinar(JSON.parse(JSON.stringify(j.datos || {})), toDoc()));
+    const cc = syncCfg(); if (cc) { cc.last = Date.now(); setSyncCfg(cc); }
+    ok = true;
+    if (SY.gen !== gen) SY.again = true;
+    if (JSON.stringify(toDoc()) !== before) render();
+    setSyncState("ok");
+  } catch (e) {
+    setSyncState(e && e.code === "clave" ? "clave" : (navigator.onLine === false ? "offline" : "error"));
+  }
+  SY.busy = false;
+  if (ok && SY.again) { SY.again = false; setTimeout(syncNow, 300); }
+}
+function openSyncSetup(){ D = { surl:"", skey:"" }; openSheet(syncForm); }
+function syncForm(){
+  return sheetHead("Conectar con Google") +
+    '<p class="muted" style="margin:0;font-size:15px">Pegá el enlace de tu script de Google y elegí una clave. En tu otro dispositivo usá el mismo enlace y la misma clave.</p>' +
+    '<div class="field"><label for="f-surl">Enlace del script</label><input id="f-surl" class="input" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://script.google.com/macros/s/…/exec" value="' + esc(D.surl) + '"></div>' +
+    '<div class="field"><label for="f-skey">Clave</label><input id="f-skey" class="input" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Al menos 6 caracteres" value="' + esc(D.skey) + '">' +
+    '<small class="muted" style="display:block;margin-top:6px;font-size:13px">La primera vez que conectás, esta clave queda guardada en el script. Anotala: la vas a necesitar en la computadora.</small></div>' +
+    '<div class="err" id="f-err"></div><div class="actions"><button class="btn green" data-a="sync-connect" id="sync-connect-btn">Conectar</button></div>';
+}
+async function syncConnect(){
+  syncDraft();
+  const url = (D.surl || "").trim().replace(/\/$/, ""), key = (D.skey || "").trim();
+  if (/\/dev$/.test(url)) return formError("Ese es el enlace de prueba. Copiá la URL de la implementación, la que termina en /exec.");
+  if (!/^https:\/\/script\.google\.com\/(macros|a\/macros\/[^/]+)\/s\/[\w-]+\/exec$/.test(url)) return formError("El enlace tiene que empezar con https://script.google.com/macros/s/ y terminar en /exec.");
+  if (key.length < 6) return formError("La clave tiene que tener al menos 6 caracteres.");
+  const btn = $("#sync-connect-btn");
+  const reset = () => { if (btn) { btn.disabled = false; btn.textContent = "Conectar"; } };
+  if (btn) { btn.disabled = true; btn.textContent = "Conectando…"; }
+  let j = null;
+  try { j = await callScript(url, { accion:"ping", clave:key }); }
+  catch (e) { reset(); return formError("No se pudo conectar. Revisá el enlace y que el script esté implementado con acceso para “Cualquier usuario”."); }
+  if (!j || !j.ok) { reset(); return formError(j && j.error === "clave" ? "La clave no coincide con la que usaste la primera vez que conectaste." : "El script respondió con un error. Revisá que hayas pegado el código completo."); }
+  setSyncCfg({ url, key, last:0 });
+  closeSheet(); render(); toast("Conectado. Sincronizando…"); syncNow();
+}
+
 function init(){
   const l = readLocal();
-  if (l && l.config) { S.config = normalize(l.config); S.months = l.months || {}; }
-  else { S.config = normalize(defaults()); S.months = {}; }
+  if (l && l.config) { S.config = normalize(l.config); S.months = l.months || {}; S.tomb = l.tomb || {}; }
+  else { S.config = normalize(defaults()); S.months = {}; S.tomb = {}; }
+  baseline(); writeLocal();
   Sync.mode = "local";
   render();
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
+  if (syncCfg()) syncNow();
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && syncCfg() && Date.now() - SY.lastTry > 15000) syncNow(); });
+  window.addEventListener("online", () => { if (syncCfg()) syncNow(); });
+  setInterval(() => { if (document.visibilityState === "visible" && syncCfg() && SY.state !== "clave") syncNow(); }, 120000);
 }
 
 /* ---------- movimientos: alta / baja ---------- */
@@ -845,13 +1028,21 @@ function viewAjustes(){
     '<label class="item"><span class="l"><b>Apariencia</b></span><select data-ch="theme"><option value="auto"' + (prefs.theme === "auto" ? " selected" : "") + '>Automática</option><option value="light"' + (prefs.theme === "light" ? " selected" : "") + '>Clara</option><option value="dark"' + (prefs.theme === "dark" ? " selected" : "") + '>Oscura</option></select></label>' +
     '</div>';
 
+  const sc = syncCfg();
+  h += '<div class="sec"><h2>Sincronización</h2></div><div class="group">' + (sc
+    ? '<div class="item"><span class="l"><span><b>Conectado a Google</b><small id="sync-status">' + esc(syncStatusText()) + '</small></span></span></div>' +
+      '<button class="item" data-a="sync-now"><span class="l"><span><b>Sincronizar ahora</b><small>También se sincroniza sola al abrir la app y después de cada cambio</small></span></span></button>' +
+      '<div class="item"><span class="l"><span><b>Desconectar este dispositivo</b><small>Tus datos quedan acá y en la planilla</small></span></span><button class="btn danger small ' + (armed === "syncoff" ? "armed" : "") + '" data-a="sync-off">' + (armed === "syncoff" ? "Confirmar" : "Desconectar") + '</button></div>'
+    : '<div class="item"><span class="l"><span><b>Usala en el iPhone y en la computadora</b><small>Conectá tu cuenta de Google para que los dos vean los mismos datos. Se guardan en una planilla de tu Drive que solo vos ves.</small></span></span></div>' +
+      '<button class="item add" data-a="sync-setup">Conectar con Google</button>') + '</div>';
+
   const lastTxt = prefs.lastExport ? "Última copia: " + fmtDate(prefs.lastExport) + "." : "Todavía no guardaste ninguna copia.";
   h += '<div class="sec"><h2>Tus datos</h2></div><div class="group">' +
-    '<div class="item"><span class="l"><span><b>Guardados solo en este dispositivo</b><small>No pasan por ningún servidor. Si borrás la app del inicio, se borran con ella. ' + lastTxt + '</small></span></span></div>' +
+    '<div class="item"><span class="l"><span><b>' + (sc ? "Guardados acá y en tu planilla de Google" : "Guardados solo en este dispositivo") + '</b><small>' + (sc ? "Si borrás la app del inicio, los recuperás conectándola de nuevo. " : "No pasan por ningún servidor. Si borrás la app del inicio, se borran con ella. ") + lastTxt + '</small></span></span></div>' +
     '<button class="item" data-a="export-xlsx"><span class="l"><span><b>Exportar a Excel</b><small>Movimientos, resumen por mes, gastos por categoría y cuentas</small></span></span></button>' +
     '<button class="item" data-a="backup"><span class="l"><span><b>Guardar copia de seguridad</b><small>Para recuperar tus datos o pasarlos a otro dispositivo</small></span></span></button>' +
     '<button class="item" data-a="restore"><span class="l"><span><b>Restaurar una copia</b><small>Reemplaza los datos de este dispositivo</small></span></span></button>' +
-    '<div class="item"><span class="l"><span><b>Borrar todos los datos</b><small>Cuentas, movimientos y objetivos. No se puede deshacer.</small></span></span><button class="btn danger small ' + (armed === "wipe" ? "armed" : "") + '" data-a="wipe">' + (armed === "wipe" ? "Confirmar" : "Borrar") + '</button></div></div>';
+    '<div class="item"><span class="l"><span><b>Borrar todos los datos</b><small>Cuentas, movimientos y objetivos' + (sc ? ", también en tus otros dispositivos" : "") + '. No se puede deshacer.</small></span></span><button class="btn danger small ' + (armed === "wipe" ? "armed" : "") + '" data-a="wipe">' + (armed === "wipe" ? "Confirmar" : "Borrar") + '</button></div></div>';
 
   h += '<div class="sec"><h2>Llevar los datos a la computadora</h2></div><div class="group"><ol class="steps">' +
     '<li>Tocá “Exportar a Excel”.</li>' +
@@ -936,7 +1127,7 @@ function syncDraft(){
   const g = id => { const el = $("#" + id); return el ? el.value : null; };
   if (!D) return;
   const map = {"f-amt":"amountText", "f-concept":"concept", "f-date":"date", "f-acc":"acc", "f-to":"to", "f-name":"name", "f-kind":"kind",
-    "f-initial":"initialText", "f-target":"targetText", "f-cur":"currency", "f-rate":"rateText", "f-fxamt":"fxText", "f-baseamt":"baseText", "f-base":"baseAcc", "f-fx":"fxAcc"};
+    "f-initial":"initialText", "f-target":"targetText", "f-cur":"currency", "f-rate":"rateText", "f-fxamt":"fxText", "f-baseamt":"baseText", "f-base":"baseAcc", "f-fx":"fxAcc", "f-surl":"surl", "f-skey":"skey"};
   Object.keys(map).forEach(id => { const v = g(id); if (v != null) D[map[id]] = v; });
 }
 function accOptions(sel, filter, plain){
@@ -1297,7 +1488,7 @@ function restoreSheet(){
   const n = Object.values(d.months).reduce((a, v) => a + (Array.isArray(v) ? v.length : 0), 0);
   return sheetHead("Restaurar copia") +
     '<p style="margin:0 0 8px">La copia es del ' + esc(fmtDate(d.exported)) + ' y tiene ' + n + (n === 1 ? " movimiento" : " movimientos") + ' y ' + (d.config.accounts || []).length + ' cuentas.</p>' +
-    '<p class="muted" style="margin:0">Va a reemplazar todo lo que hay ahora en este dispositivo.</p>' +
+    '<p class="muted" style="margin:0">Va a reemplazar todo lo que hay ahora en este dispositivo' + (syncCfg() ? " y en los otros que estén sincronizados" : "") + '.</p>' +
     '<div class="actions"><button class="btn ghost" data-a="close-sheet">Cancelar</button><button class="btn green" data-a="restore-ok">Restaurar</button></div>';
 }
 function onRestoreFile(e){
@@ -1389,7 +1580,11 @@ const A = {
   "restore": () => { const i = $("#restore-in"); i.value = ""; i.click(); },
   "restore-ok": () => applyRestore(),
   "dismiss-install": () => { prefs.hideInstall = true; savePrefs(); render(); },
-  "wipe": () => wipe()
+  "wipe": () => wipe(),
+  "sync-setup": () => openSyncSetup(),
+  "sync-connect": () => syncConnect(),
+  "sync-now": () => { if (SY.state === "clave") { UI.tab = "ajustes"; render(); window.scrollTo(0, 0); return; } syncNow(); },
+  "sync-off": () => { if (armed !== "syncoff") { armed = "syncoff"; render(); return; } armed = null; setSyncCfg(null); SY.state = ""; render(); toast("Este dispositivo dejó de sincronizar"); }
 };
 document.addEventListener("click", e => {
   const el = e.target.closest("[data-a]");
@@ -1426,7 +1621,7 @@ document.addEventListener("change", e => {
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && $("#sheet").classList.contains("open")) closeSheet();
   if (e.key === "Enter" && e.target.closest && e.target.closest(".sheet") && e.target.tagName === "INPUT") {
-    const save = $(".sheet [data-a^='f-save']"); if (save) { e.preventDefault(); save.click(); }
+    const save = $(".sheet [data-a^='f-save'], .sheet [data-a='sync-connect']"); if (save) { e.preventDefault(); save.click(); }
   }
 });
 
