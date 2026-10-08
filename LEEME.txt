@@ -1,0 +1,23 @@
+PULSO - Cómo publicarla gratis en GitHub Pages
+==============================================
+
+Archivos (subilos todos juntos, sin carpetas):
+  index.html, manifest.webmanifest, sw.js, icon-180.png, icon-192.png, icon-512.png
+
+1. Creá una cuenta gratis en https://github.com
+2. Arriba a la derecha: "+" > "New repository". Nombre: pulso. Dejalo en "Public" y tocá "Create repository".
+3. En la página del repositorio tocá "uploading an existing file".
+   Arrastrá los 6 archivos y tocá "Commit changes".
+4. Entrá a "Settings" > "Pages". En "Branch" elegí "main" y la carpeta "/ (root)". Tocá "Save".
+5. En uno o dos minutos la app queda en:  https://TU-USUARIO.github.io/pulso/
+
+En el iPhone:
+  - Abrí esa dirección en Safari > Compartir > "Agregar a inicio".
+  - Usala siempre desde el ícono: ahí quedan tus datos (Safari los guarda por separado).
+
+Tus datos:
+  - Se guardan solo en el teléfono. El código es público, tus números no.
+  - Si borrás el ícono del inicio, se borran los datos. Usá "Guardar copia de seguridad" cada tanto.
+  - Para pasarlos a la computadora: Ajustes > "Exportar a Excel" y mandalo por AirDrop, Mail o WhatsApp.
+
+Para actualizar la app más adelante, subí el index.html nuevo al mismo repositorio.
