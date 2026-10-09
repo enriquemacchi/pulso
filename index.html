@@ -580,6 +580,33 @@ function balances(){
 const CUOTAS = [1,2,3,4,5,6,7,8,9,10,11,12,14,15,18,20,24,30,36,48];
 const isCard = id => { const a = accById(id); return !!a && a.kind === "tarjeta"; };
 const cards = () => S.config.accounts.filter(a => a.kind === "tarjeta");
+const primaryCards = () => cards().filter(a => !a.twinOf);
+const twinOf = a => a ? S.config.accounts.find(x => x.twinOf === a.id && x.kind === "tarjeta") || null : null;
+function ensureTwin(a){
+  let t = twinOf(a);
+  if (!t) {
+    t = { id:newId(), name:a.name + " USD", kind:"tarjeta", currency:"USD", initial:0, cierre:a.cierre, vence:a.vence, twinOf:a.id };
+    if (a.color) t.color = a.color;
+    S.config.accounts.push(t); persistConfig();
+  }
+  return t;
+}
+function mergedCard(a){
+  const t = twinOf(a), cv = cardView(a), tv = t ? cardView(t) : null, by = {};
+  cv.list.forEach(st => by[st.key] = { key:st.key, s:st.s, ars:st, usd:null });
+  if (tv) tv.list.forEach(st => { (by[st.key] = by[st.key] || { key:st.key, s:st.s, ars:null, usd:null }).usd = st; });
+  const rank = { vencido:5, "a pagar":4, abierto:3, futuro:2, pagado:1 };
+  const list = Object.keys(by).sort().map(k => {
+    const x = by[k], states = [x.ars, x.usd].filter(Boolean).map(st => st.state);
+    x.state = states.sort((p, q) => (rank[q] || 0) - (rank[p] || 0))[0] || "futuro";
+    if (states.length > 1 && states.every(z => z === "pagado")) x.state = "pagado";
+    x.pendArs = x.ars ? x.ars.pend : 0; x.pendUsd = x.usd ? x.usd.pend : 0;
+    x.totalBase = (x.ars ? x.ars.total : 0) + (x.usd ? toBase(x.usd.total, "USD") : 0);
+    return x;
+  });
+  return { t, cv, tv, list, next:list.find(x => x.pendArs > 0.5 || x.pendUsd > 0.005), pendArs:cv.pend, pendUsd:tv ? tv.pend : 0,
+    last:[cv.last, tv && tv.last].filter(Boolean).sort((p, q) => p.key < q.key ? 1 : -1)[0] || null };
+}
 const lastDay = (y, m) => new Date(y, m + 1, 0).getDate();
 function stmtAt(a, y, m){
   const c = +a.cierre || 25, v = +a.vence || 5;
@@ -594,12 +621,13 @@ function stmtOf(a, dateISO){
   if (d.getDate() > Math.min(+a.cierre || 25, lastDay(y, m))) m++;
   return stmtAt(a, y, m);
 }
-const stmtName = s => MESES[s.m] + (s.y !== new Date().getFullYear() ? " " + s.y : "");
+const stmtName = s => MESES[s.due.getMonth()] + (s.due.getFullYear() !== new Date().getFullYear() ? " " + s.due.getFullYear() : "");
 const shortDate = d => d.getDate() + " " + MESES_C[d.getMonth()];
 function cuotasOf(mv, a){
   const n = mv.type === "gasto" ? Math.max(1, Math.round(+mv.cuotas || 1)) : 1;
   const k = Math.min(n, Math.max(1, Math.round(+mv.cuotaIni || 1)));
-  const rem = n - k + 1, first = stmtOf(a, mv.date);
+  const dp = mv.desde ? String(mv.desde).split("-").map(Number) : null;
+  const rem = n - k + 1, first = dp ? stmtAt(a, dp[0], dp[1] - 1) : stmtOf(a, mv.date);
   const base = Math.floor(mv.amount / rem * 100) / 100, out = [];
   for (let j = 0; j < rem; j++) out.push({ s:stmtAt(a, first.y, first.m + j), amount:j === rem - 1 ? round2(mv.amount - base * (rem - 1)) : base, num:k + j, n, mov:mv });
   return out;
@@ -612,8 +640,21 @@ function cardStatements(a){
       const sign = m.type === "ingreso" ? -1 : 1;
       cuotasOf(m, a).forEach(q => { const st = get(q.s); st.total = round2(st.total + sign * q.amount); st.lines.push(Object.assign({ sign }, q)); });
     }
-    if (m.to === a.id && m.type === "transfer" && m.resumen) {
-      const p = String(m.resumen).split("-").map(Number); const st = get(stmtAt(a, p[0], p[1] - 1)); st.paid = round2(st.paid + m.amount);
+    if (m.to === a.id && (m.type === "transfer" || m.type === "cambio") && m.resumen) {
+      const p = String(m.resumen).split("-").map(Number); const st = get(stmtAt(a, p[0], p[1] - 1)); st.paid = round2(st.paid + (m.type === "cambio" ? m.amountTo : m.amount));
+    }
+  });
+  // suscripciones y gastos mensuales que todavía no se cargaron: se proyectan en los próximos resúmenes
+  const now = new Date(), todayISO = iso(now);
+  S.config.recurrentes.filter(r => r.type === "gasto" && r.acc === a.id && +r.amount > 0).forEach(r => {
+    for (let k = 0; k < 13; k++) {
+      const y = now.getFullYear(), mo = now.getMonth() + k, b = new Date(y, mo, 1);
+      const dISO = iso(new Date(b.getFullYear(), b.getMonth(), Math.min(+r.day || 1, lastDay(b.getFullYear(), b.getMonth()))));
+      if (dISO < todayISO) continue;
+      if ((S.months[dISO.slice(0, 7)] || []).some(m => m.rec === r.id)) continue;
+      const st = get(stmtOf(a, dISO));
+      st.total = round2(st.total + +r.amount); st.proj = round2((st.proj || 0) + +r.amount);
+      st.lines.push({ sign:1, proj:true, s:st.s, amount:+r.amount, num:1, n:1, day:+r.day, mov:{ id:null, type:"gasto", concept:r.concept, cat:r.cat, rec:r.id, sub:!!r.sub } });
     }
   });
   return Object.keys(map).sort().map(k => map[k]);
@@ -624,10 +665,13 @@ function cardView(a){
   const list = cardStatements(a).filter(st => st.key >= prev.key && (st.total > 0.005 || st.paid > 0.005));
   list.forEach(st => {
     st.pend = round2(Math.max(0, st.total - st.paid));
-    st.state = st.key === prev.key ? (st.pend <= 0.5 ? "pagado" : st.s.due < today0 ? "vencido" : "a pagar") : st.key === open.key ? "abierto" : "futuro";
+    st.realPend = round2(Math.max(0, st.total - (st.proj || 0) - st.paid));
+    st.empty = st.total <= 0.005 && st.paid <= 0.005;
+    st.state = st.key === prev.key ? (st.empty ? "sindatos" : st.pend <= 0.5 ? "pagado" : st.s.due < today0 ? "vencido" : "a pagar") : st.key === open.key ? "abierto" : "futuro";
     if (st.state !== "pagado" && st.key !== prev.key && st.pend <= 0.5 && st.paid > 0) st.state = "pagado";
   });
-  return { open, prev, list, pend:round2(sum(list.map(st => st.pend))), next:list.find(st => st.pend > 0.5), last:list.length ? list[list.length - 1] : null };
+  const real = list.filter(st => !st.empty && st.total - (st.proj || 0) > 0.005);
+  return { open, prev, list, pend:round2(sum(list.map(st => st.realPend))), next:list.find(st => st.pend > 0.5), last:real.length ? real[real.length - 1] : null };
 }
 
 /* periodos (respeta "mi mes empieza el día") */
@@ -944,6 +988,7 @@ async function syncNow(){
     applyDoc(combinar(JSON.parse(JSON.stringify(j.datos || {})), toDoc()));
     const mk = mergeMarket(j.mercado);
     applyAutoRate();
+    autoRecs();
     const cc = syncCfg(); if (cc) { cc.last = Date.now(); setSyncCfg(cc); }
     ok = true;
     if (SY.gen !== gen) SY.again = true;
@@ -1025,7 +1070,9 @@ function init(){
   else { S.config = normalize(defaults()); S.months = {}; S.tomb = {}; }
   baseline(); writeLocal();
   Sync.mode = "local";
+  const nAuto = autoRecs();
   render();
+  if (nAuto) setTimeout(() => toast(nAuto === 1 ? "Se cargó 1 movimiento mensual" : "Se cargaron " + nAuto + " movimientos mensuales"), 600);
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   if (syncCfg()) syncNow(); else fetchMarketDirect();
   setInterval(() => { if (document.visibilityState === "visible" && !syncCfg()) fetchMarketDirect(); }, 30 * 60000);
@@ -1054,11 +1101,28 @@ function removeMov(mov){
 }
 function findMov(id){ return allMovs().find(m => m.id === id); }
 
+function autoRecs(){
+  const now = new Date(), todayISO = iso(now); let n = 0;
+  S.config.recurrentes.filter(r => r.auto && accById(r.acc) && +r.amount > 0).forEach(r => {
+    [-1, 0].forEach(k => {
+      if (k === -1 && !r.since) return;
+      const b = new Date(now.getFullYear(), now.getMonth() + k, 1), key = iso(b).slice(0, 7);
+      if (r.since && key < r.since) return;
+      const d = iso(new Date(b.getFullYear(), b.getMonth(), Math.min(+r.day || 1, lastDay(b.getFullYear(), b.getMonth()))));
+      if (d > todayISO) return;
+      const id = "rec-" + r.id + "-" + key;
+      if ((S.months[key] || []).some(m => m.rec === r.id) || (S.tomb && S.tomb["m:" + id])) return;
+      upsertMov({ id, type:r.type, amount:+r.amount, concept:r.concept, cat:r.cat || null, acc:r.acc, to:r.to || null, date:d, rec:r.id, created:Date.now() });
+      n++;
+    });
+  });
+  return n;
+}
 function pendingRecs(){
   const today = new Date(), k = iso(today).slice(0, 7);
   const arr = S.months[k] || [];
   const last = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
-  return S.config.recurrentes.filter(r => Math.min(r.day, last) <= today.getDate() && !arr.some(m => m.rec === r.id) && accById(r.acc));
+  return S.config.recurrentes.filter(r => !r.auto && Math.min(r.day, last) <= today.getDate() && !arr.some(m => m.rec === r.id) && accById(r.acc));
 }
 function registerRecs(){
   const today = new Date();
@@ -1088,11 +1152,12 @@ function movRow(m, showDate){
     metaParts = [esc(catName(m.cat)), esc(accName(m.acc))];
     cls = m.type === "ingreso" ? "pos" : "neg";
     amt = money(m.type === "ingreso" ? m.amount : -m.amount, true, accCur(m.acc));
-    if (m.previo) { cls = ""; amt = money(m.amount, false, accCur(m.acc)); metaParts.push("Cuotas " + m.cuotaIni + " a " + m.cuotas + " pendientes"); }
+    if (m.ajusteResumen) { cls = ""; amt = money(m.type === "ingreso" ? -m.amount : m.amount, false, accCur(m.acc)); const ca = accById(m.acc), p = String(m.ajusteResumen).split("-").map(Number); metaParts.push("Ajuste del resumen de " + (ca ? stmtName(stmtAt(ca, p[0], p[1] - 1)) : "")); }
+    else if (m.previo) { cls = ""; amt = money(m.amount, false, accCur(m.acc)); metaParts.push("Cuotas " + m.cuotaIni + " a " + m.cuotas + " pendientes"); }
     else if (+m.cuotas > 1) metaParts.push("En " + m.cuotas + " cuotas");
   }
   if (m.rev) metaParts.push('<span class="rev">Elegí la categoría</span>');
-  if (m.type === "transfer" && m.resumen) { const p = String(m.resumen).split("-").map(Number); metaParts.push("Pago resumen de " + MESES[p[1] - 1]); }
+  if (m.type === "transfer" && m.resumen) { const p = String(m.resumen).split("-").map(Number), ca = accById(m.to); metaParts.push("Pago resumen de " + (ca ? stmtName(stmtAt(ca, p[0], p[1] - 1)) : MESES[p[1] - 1])); }
   if (m.rec) metaParts.push("Mensual");
   const d = fromISO(m.date);
   return '<button class="row' + (UI.flash === m.id && Date.now() - (UI.flashAt || 0) < 2500 ? " flash" : "") + '" data-a="edit-mov" data-id="' + esc(m.id) + '">' + dot +
@@ -1123,10 +1188,10 @@ function homeHero(bal){
     '<div class="big amt' + (dispT < 0 ? " neg" : "") + '" data-count="disp" data-val="' + dispT + '">' + money(dispT) + '</div>' +
     (dispA.length > 1 ? '<div class="split">' + dispA.map(a => '<div><span><i class="adot" style="background:' + esc(accColor(a)) + '"></i>' + esc(a.name) + '</span><b class="amt' + ((bal[a.id] || 0) < 0 ? " neg" : "") + '">' + money(bal[a.id] || 0, false, a.currency) + '</b></div>').join("") + '</div>' : "");
   if (resA.length) {
-    const dues = cards().filter(c => c.currency === BASE()).map(c => cardView(c).next).filter(Boolean);
-    const dueT = round2(sum(dues.map(st => st.pend))), first = dues.slice().sort((x, y) => x.s.due - y.s.due)[0], diff = round2(resT - dueT);
+    const dues = primaryCards().map(c => mergedCard(c).next).filter(Boolean);
+    const dueT = round2(sum(dues.map(x => x.pendArs + toBase(x.pendUsd, "USD")))), first = dues.slice().sort((x, y) => x.s.due - y.s.due)[0], diff = round2(resT - dueT);
     h += '<div class="reserve"><div class="reserve-h"><div><span>Reservado para la tarjeta</span><b class="amt">' + money(resT) + '</b><small>' + resA.map(a => esc(a.name)).join(", ") + '</small></div>' +
-      (dueT > 0 ? '<div class="r"><span>' + (dues.length > 1 ? "Próximos resúmenes" : "Próximo resumen") + '</span><b class="amt">' + money(dueT) + '</b><small>Vence el ' + shortDate(first.s.due) + '</small></div>' : "") + '</div>' +
+      (dueT > 0 ? '<div class="r"><span>' + (dues.length > 1 ? "Próximos resúmenes" : "Próximo resumen") + '</span><b class="amt">' + money(dueT) + '</b><small>Vence el ' + shortDate(first.s.due) + (dues.some(x => x.pendUsd > 0.005) ? ", con dólares" : "") + '</small></div>' : "") + '</div>' +
       (dueT > 0 ? '<p class="' + (diff >= 0 ? "pos" : "neg") + '">' + (diff >= 0 ? "Alcanza para el próximo resumen" + (diff > 0.5 ? " y sobran " + money(diff) : "") + "." : "Te faltan " + money(-diff) + " para el próximo resumen.") + '</p>' : "") + '</div>';
   }
   return h + '<p class="rate-line"><button class="link" data-a="goto-patrimonio">Ver patrimonio completo</button></p></section>';
@@ -1180,16 +1245,16 @@ function homeCuentas(bal){
     || '<div class="row"><span></span><span class="muted">No tenés cuentas para mostrar acá.</span><span></span></div>') + '</div>';
 }
 function homeTarjetas(){
-  const cs = cards();
+  const cs = primaryCards();
   if (!cs.length) return "";
-  const nxt = cs.map(a => cardView(a).next).filter(Boolean);
-  let h = secHead("tarjetas", "Tarjetas", '<button class="link" data-a="goto-cards">Ver cuotas</button>', nxt.length ? '<small class="amt">' + money(sum(nxt.map(x => x.pend))) + '</small>' : "");
+  const nxt = cs.map(a => mergedCard(a).next).filter(Boolean);
+  let h = secHead("tarjetas", "Tarjetas", '<button class="link" data-a="goto-cards">Ver cuotas</button>', nxt.length ? '<small class="amt">' + money(sum(nxt.map(x => x.pendArs + toBase(x.pendUsd, "USD")))) + '</small>' : "");
   if (isFolded("tarjetas")) return h;
   return h + '<div class="ledger">' + cs.map(a => {
-    const cv = cardView(a), nx = cv.next;
+    const mc = mergedCard(a), nx = mc.next;
     return '<button class="row" data-a="open-card" data-id="' + esc(a.id) + '">' + accBadge(a) + '<span class="t"><b>' + esc(a.name) + '</b><span class="meta"><span>' +
-      (nx ? "Resumen de " + esc(stmtName(nx.s)) + ", vence " + shortDate(nx.s.due) : "Sin pagos pendientes") + '</span></span></span><span class="r"><b class="amt">' + money(nx ? nx.pend : 0, false, accCur(a.id)) + '</b>' +
-      (cv.pend > (nx ? nx.pend : 0) + 0.5 ? '<small>Total en cuotas ' + money(cv.pend, false, accCur(a.id)) + '</small>' : "") + '</span></button>';
+      (nx ? "Resumen de " + esc(stmtName(nx.s)) + ", vence " + shortDate(nx.s.due) : "Sin pagos pendientes") + '</span></span></span><span class="r"><b class="amt">' + money(nx ? nx.pendArs : 0, false, accCur(a.id)) + '</b>' +
+      (nx && nx.pendUsd > 0.005 ? '<small class="amt">+ ' + money(nx.pendUsd, false, "USD") + '</small>' : mc.pendArs > (nx ? nx.pendArs : 0) + 0.5 ? '<small>Total en cuotas ' + money(mc.pendArs, false, accCur(a.id)) + '</small>' : "") + '</span></button>';
   }).join("") + '</div>';
 }
 function homeObjetivos(bal){
@@ -1534,43 +1599,58 @@ function anComparar(){
 
 /* tarjetas */
 function viewTarjetas(){
-  const cs = cards();
+  const cs = primaryCards();
   let h = '<header class="top"><button class="iconbtn back" data-a="tab" data-tab="inicio" aria-label="Volver al inicio">' + ic("left") + '</button><h1 class="title" style="margin:6px 0 4px;flex:1">Tarjetas</h1>' + syncBadge() + '</header>';
   if (!cs.length) return h + '<div class="empty" style="margin-top:12px"><h3>Agregá tu tarjeta</h3><p>Creá una cuenta de tipo Tarjeta con su día de cierre y de vencimiento. Después cargá las cuotas que venís pagando y tus compras nuevas.</p><button class="btn" data-a="new-card">Agregar tarjeta</button></div>';
-  if (!isCard(UI.card)) UI.card = cs[0].id;
-  const a = accById(UI.card), cur = accCur(a.id), cv = cardView(a);
+  const uc = accById(UI.card);
+  if (uc && uc.twinOf) UI.card = uc.twinOf;
+  if (!cs.some(c => c.id === UI.card)) UI.card = cs[0].id;
+  const a = accById(UI.card), cur = accCur(a.id), mc = mergedCard(a), hasUsd = !!mc.t;
   if (cs.length > 1) h += '<div class="chips" style="margin-bottom:10px">' + cs.map(c => '<button class="chip ' + (c.id === a.id ? "on" : "") + '" data-a="open-card" data-id="' + esc(c.id) + '">' + esc(c.name) + '</button>').join("") + '</div>';
 
-  h += '<div class="balance" style="margin-top:4px"><span class="muted">Pendiente en ' + esc(a.name) + '</span><div class="big amt">' + money(cv.pend, false, cur) + '</div>' +
+  h += '<div class="balance" style="margin-top:4px"><span class="muted">Pendiente en ' + esc(a.name) + '</span><div class="big amt">' + money(mc.pendArs, false, cur) + '</div>' +
+    (hasUsd && mc.pendUsd > 0.005 ? '<p class="amt" style="margin:-4px 0 8px;font-size:20px;font-weight:600">+ ' + money(mc.pendUsd, false, "USD") + '</p>' : "") +
     '<p class="muted" style="margin:0;font-size:14px">Cierra el ' + (+a.cierre || 25) + ' y vence el ' + (+a.vence || 5) + ' de cada mes. <button class="link" data-a="edit-acc" data-id="' + esc(a.id) + '">Cambiar</button></p>' +
-    (cv.last && cv.pend > 0.5 ? '<p class="muted" style="margin:6px 0 0;font-size:14px">Con lo cargado hasta hoy, tus cuotas terminan en el resumen de ' + esc(stmtName(cv.last.s)) + '.</p>' : "") +
-    '<div class="btnrow"><button class="btn green small" data-a="card-buy">Nueva compra</button><button class="btn ghost small" data-a="card-previo">Cuotas que ya venías pagando</button></div></div>';
+    (mc.last && (mc.pendArs > 0.5 || mc.pendUsd > 0.005) ? '<p class="muted" style="margin:6px 0 0;font-size:14px">Con lo cargado hasta hoy, tus cuotas terminan en el resumen de ' + esc(stmtName(mc.last.s)) + '. Las suscripciones siguen todos los meses.</p>' : "") +
+    '<div class="btnrow"><button class="btn green small" data-a="card-buy">Nueva compra</button><button class="btn ghost small" data-a="card-sub">Nueva suscripción</button><button class="btn ghost small" data-a="card-previo">Cuotas que ya venías pagando</button></div></div>';
 
-  if (!cv.list.length) return h + '<div class="empty" style="margin-top:14px"><p>Todavía no hay consumos ni cuotas en esta tarjeta. Empezá por las cuotas que ya venías pagando: las ves en tu último resumen, en “cuotas a vencer”.</p></div>';
+  if (!mc.list.length) return h + '<div class="empty" style="margin-top:14px"><p>Todavía no hay consumos ni cuotas en esta tarjeta. Empezá por las cuotas que ya venías pagando: las ves en tu último resumen, en “cuotas a vencer”.</p></div>';
 
-  const shown = cv.list.slice(0, 12), max = Math.max(1, ...shown.map(st => st.total));
+  const shown = mc.list.slice(0, 12), max = Math.max(1, ...shown.map(x => x.totalBase));
   const W_ = 340, H_ = 150, base = 118, gw = W_ / Math.max(6, shown.length);
   let svg = '<svg viewBox="0 0 ' + W_ + ' ' + H_ + '" width="100%" role="img" aria-label="Total de cada resumen">';
-  shown.forEach((st, i) => {
-    const x = i * gw + gw / 2, bw = Math.min(16, gw * 0.55), hh = Math.max(2, st.total / max * 96);
-    const col = st.state === "pagado" ? "var(--ink-3)" : st === cv.next ? "var(--red)" : "var(--gold)";
-    svg += '<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (base - hh).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + hh.toFixed(1) + '" rx="3" fill="' + col + '"/>';
-    svg += '<text x="' + x.toFixed(1) + '" y="' + (base + 16) + '" text-anchor="middle" font-size="11" fill="var(--ink-3)" font-family="inherit">' + cap(MESES_C[st.s.m]) + '</text>';
+  shown.forEach((x, i) => {
+    const cx = i * gw + gw / 2, bw = Math.min(16, gw * 0.55), hh = Math.max(2, x.totalBase / max * 96);
+    const col = x.state === "pagado" ? "var(--ink-3)" : x === mc.next ? "var(--red)" : "var(--gold)";
+    svg += '<rect x="' + (cx - bw / 2).toFixed(1) + '" y="' + (base - hh).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + hh.toFixed(1) + '" rx="3" fill="' + col + '"/>';
+    svg += '<text x="' + cx.toFixed(1) + '" y="' + (base + 16) + '" text-anchor="middle" font-size="11" fill="var(--ink-3)" font-family="inherit">' + cap(MESES_C[x.s.due.getMonth()]) + '</text>';
   });
   svg += '<line x1="0" x2="' + W_ + '" y1="' + base + '" y2="' + base + '" stroke="var(--rule)"/></svg>';
-  h += '<div class="sec"><h2>Próximos resúmenes</h2></div><div class="chart">' + svg + '</div>';
+  h += '<div class="sec"><h2>Próximos resúmenes</h2>' + (hasUsd ? '<small>Dólares a ' + (rateOf("USD") ? fmtNum(rateOf("USD")) : "sin cotización") + '</small>' : "") + '</div><div class="chart">' + svg + '</div>';
 
-  const open = UI.stOpen || (cv.next ? cv.next.key : shown[0].key);
-  shown.concat(cv.list.slice(12)).forEach(st => {
-    const pill = { pagado:'<span class="pillst ok">Pagado</span>', vencido:'<span class="pillst due">Vencido</span>', "a pagar":'<span class="pillst due">A pagar</span>', abierto:'<span class="pillst open">Abierto</span>', futuro:"" }[st.state];
-    const isOpen = st.key === open;
-    h += '<div class="stmt"><button class="stmt-h" data-a="st-toggle" data-v="' + st.key + '" aria-expanded="' + isOpen + '"><span><b>Resumen de ' + esc(stmtName(st.s)) + '</b>' + pill + '</span><b class="amt">' + money(st.total, false, cur) + '</b>' +
-      '<small>' + (st.state === "abierto" ? "Cierra el " + shortDate(st.s.close) + ", vence el " + shortDate(st.s.due) : "Vence el " + shortDate(st.s.due)) + '</small></button>';
+  const open = UI.stOpen || (mc.next ? mc.next.key : shown[0].key);
+  mc.list.forEach(x => {
+    const pill = { pagado:'<span class="pillst ok">Pagado</span>', vencido:'<span class="pillst due">Vencido</span>', "a pagar":'<span class="pillst due">A pagar</span>', abierto:'<span class="pillst open">Abierto</span>', futuro:"" }[x.state] || "";
+    const isOpen = x.key === open, arsT = x.ars ? x.ars.total : 0, usdT = x.usd ? x.usd.total : 0;
+    const amtTxt = (arsT > 0.005 || !usdT ? money(arsT, false, cur) : "") + (usdT > 0.005 ? (arsT > 0.005 ? " + " : "") + money(usdT, false, "USD") : "");
+    const hasProj = (x.ars && x.ars.proj) || (x.usd && x.usd.proj);
+    h += '<div class="stmt"><button class="stmt-h" data-a="st-toggle" data-v="' + x.key + '" aria-expanded="' + isOpen + '"><span><b>Resumen de ' + esc(stmtName(x.s)) + '</b>' + pill + '</span><b class="amt">' + amtTxt + '</b>' +
+      '<small>' + (x.state === "abierto" ? "Cierra el " + shortDate(x.s.close) + ", vence el " + shortDate(x.s.due) : "Vence el " + shortDate(x.s.due)) + (hasProj ? ". Incluye suscripciones estimadas" : "") + '</small></button>';
     if (isOpen) {
-      h += '<div class="stmt-l">' + st.lines.slice().sort((x, y) => y.amount - x.amount).map(q => '<button class="row" data-a="edit-mov" data-id="' + esc(q.mov.id) + '"><span class="t"><b>' + esc(q.mov.concept || catName(q.mov.cat)) + '</b><span class="meta"><span>' +
-        (q.n > 1 ? "Cuota " + q.num + " de " + q.n : q.sign < 0 ? "Devolución" : "Un pago") + '</span><span>' + esc(q.mov.type === "transfer" ? "Transferencia" : catName(q.mov.cat)) + '</span></span></span><span class="r"><b class="amt ' + (q.sign < 0 ? "pos" : "") + '">' + money(q.sign * q.amount, q.sign < 0, cur) + '</b></span></button>').join("") + '</div>';
-      h += '<div class="stmt-f"><span>' + (st.paid > 0 ? "Pagado " + money(st.paid, false, cur) : st.state === "futuro" ? "Todavía no cerró" : "") + '</span>' +
-        (st.pend > 0.5 && st.state !== "futuro" ? '<button class="btn small" data-a="card-pay" data-v="' + st.key + '">Registrar pago</button>' : "") + '</div>';
+      const lines = [].concat(x.ars ? x.ars.lines.map(q => Object.assign({ cur }, q)) : [], x.usd ? x.usd.lines.map(q => Object.assign({ cur:"USD" }, q)) : []);
+      h += '<div class="stmt-l">' + lines.sort((p, q) => toBase(q.amount, q.cur) - toBase(p.amount, p.cur)).map(q => {
+        const label = q.proj ? (q.mov.sub ? "Suscripción, se carga el día " + q.day : "Mensual, el día " + q.day) : q.mov.ajusteResumen ? "Ajuste al total del banco" : q.n > 1 ? "Cuota " + q.num + " de " + q.n : q.sign < 0 ? "Devolución" : (q.mov.rec ? "Suscripción" : "Un pago");
+        const inner = '<span class="t"><b>' + esc(q.mov.concept || catName(q.mov.cat)) + '</b><span class="meta"><span>' + esc(label) + '</span><span>' + esc(q.mov.type === "transfer" ? "Transferencia" : catName(q.mov.cat)) + '</span></span></span>' +
+          '<span class="r"><b class="amt ' + (q.sign < 0 ? "pos" : q.proj ? "faint" : "") + '">' + money(q.sign * q.amount, q.sign < 0, q.cur) + '</b></span>';
+        return q.proj ? '<div class="row">' + inner + '</div>' : '<button class="row" data-a="edit-mov" data-id="' + esc(q.mov.id) + '">' + inner + '</button>';
+      }).join("") + '</div>';
+      const paidTxt = [x.ars && x.ars.paid > 0 ? money(x.ars.paid, false, cur) : "", x.usd && x.usd.paid > 0 ? money(x.usd.paid, false, "USD") : ""].filter(Boolean).join(" + ");
+      const canPay = x.state !== "futuro";
+      h += '<div class="stmt-f"><span>' + (paidTxt ? "Pagado " + paidTxt : x.state === "futuro" ? "Todavía no cerró" : "") +
+        (x.ars && x.key === mc.cv.prev.key ? ' <button class="link" data-a="card-adj" data-v="' + x.key + '">Ajustar al total del banco</button>' : "") + '</span>' +
+        '<span style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">' +
+        (canPay && x.pendArs > 0.5 ? '<button class="btn small" data-a="card-pay" data-v="' + x.key + '">Pagar pesos</button>' : "") +
+        (canPay && x.pendUsd > 0.005 ? '<button class="btn small" data-a="card-pay-usd" data-v="' + x.key + '">Pagar dólares</button>' : "") + '</span></div>';
     }
     h += '</div>';
   });
@@ -1613,8 +1693,8 @@ function viewAjustes(){
 
   h += '<div class="sec"><h2>Presupuestos</h2></div><div class="group"><button class="item add" data-a="budgets">' + (budgetRows().length ? "Editar presupuestos del mes" : "Crear presupuestos del mes") + '</button></div>';
   h += '<div class="sec"><h2>Movimientos mensuales</h2></div><div class="group">' + (S.config.recurrentes.length ? S.config.recurrentes.map(r =>
-    '<div class="item"><span class="l"><span><b>' + esc(r.concept || catName(r.cat)) + '</b><small>Día ' + r.day + ', ' + esc(accName(r.acc)) + '</small></span></span><span class="l"><span class="amt ' + (r.type === "ingreso" ? "pos" : r.type === "gasto" ? "neg" : "") + '">' + money(r.type === "gasto" ? -r.amount : r.amount, r.type !== "transfer", accCur(r.acc)) + '</span><button class="x ' + (armed === "rec:" + r.id ? "armed" : "") + '" data-a="del-rec" data-id="' + esc(r.id) + '" aria-label="Dejar de repetir">' + ic("x", 16) + '</button></span></div>').join("")
-    : '<div class="item"><span class="muted" style="font-size:14px">Activá “Repetir cada mes” al registrar un movimiento, como el sueldo o el alquiler.</span></div>') + '</div>';
+    '<div class="item"><span class="l"><span><b>' + esc(r.concept || catName(r.cat)) + '</b><small>Día ' + r.day + ', ' + esc(accName(r.acc)) + (r.sub ? ", suscripción" : r.auto ? ", se carga solo" : "") + '</small></span></span><span class="l"><span class="amt ' + (r.type === "ingreso" ? "pos" : r.type === "gasto" ? "neg" : "") + '">' + money(r.type === "gasto" ? -r.amount : r.amount, r.type !== "transfer", accCur(r.acc)) + '</span><button class="x ' + (armed === "rec:" + r.id ? "armed" : "") + '" data-a="del-rec" data-id="' + esc(r.id) + '" aria-label="Dejar de repetir">' + ic("x", 16) + '</button></span></div>').join("")
+    : '<div class="item"><span class="muted" style="font-size:14px">Activá “Repetir cada mes” al registrar un movimiento, como el sueldo o el alquiler. Para la tarjeta, elegí “Suscripción mensual”.</span></div>') + '</div>';
 
   const curOpts = [["ARS","Peso argentino"],["USD","Dólar"],["EUR","Euro"],["UYU","Peso uruguayo"],["CLP","Peso chileno"],["MXN","Peso mexicano"]];
   h += '<div class="sec"><h2>Preferencias</h2></div><div class="group">' +
@@ -1742,6 +1822,11 @@ function openMovForm(m, preset){
     D = clone(m); D._orig = clone(m);
     D.amountText = fmtIn(m.amount);
     D.repeat = !!(m.rec && S.config.recurrentes.some(r => r.id === m.rec));
+    const tpl = m.rec ? S.config.recurrentes.find(r => r.id === m.rec) : null;
+    D.auto = !!(tpl && tpl.auto);
+    const acc0 = accById(m.acc);
+    if (acc0 && acc0.twinOf && (m.type === "gasto" || m.type === "ingreso")) { D.acc = acc0.twinOf; D.cardCur = "USD"; }
+    if (tpl && tpl.sub) D.cuotas = "sub";
     if (m.type === "cambio") {
       const compra = m.dir !== "venta";
       D.baseAcc = compra ? m.acc : m.to; D.fxAcc = compra ? m.to : m.acc;
@@ -1762,7 +1847,7 @@ function syncDraft(){
   if (!D) return;
   const map = {"f-amt":"amountText", "f-concept":"concept", "f-date":"date", "f-acc":"acc", "f-to":"to", "f-name":"name", "f-kind":"kind",
     "f-initial":"initialText", "f-target":"targetText", "f-cur":"currency", "f-rate":"rateText", "f-fxamt":"fxText", "f-baseamt":"baseText", "f-base":"baseAcc", "f-fx":"fxAcc", "f-surl":"surl", "f-skey":"skey",
-    "f-cuotas":"cuotas", "f-resumen":"resumen", "f-valor":"valorText", "f-ntot":"totalN", "f-nnext":"nextN", "f-cierre":"cierre", "f-vence":"vence", "f-rol":"rol", "f-val":"valueText"};
+    "f-cuotas":"cuotas", "f-resumen":"resumen", "f-valor":"valorText", "f-ntot":"totalN", "f-nnext":"nextN", "f-cierre":"cierre", "f-vence":"vence", "f-rol":"rol", "f-val":"valueText", "f-total":"totalText"};
   Object.keys(map).forEach(id => { const v = g(id); if (v != null) D[map[id]] = v; });
 }
 function accOptions(sel, filter, plain){
@@ -1801,13 +1886,13 @@ function movForm(){
     h += '<div class="two"><div class="field"><label for="f-date">Fecha</label><input id="f-date" type="date" class="input" value="' + esc(D.date) + '"></div>' +
       '<div class="field"><label for="f-concept">Concepto</label><input id="f-concept" class="input" maxlength="80" placeholder="Opcional" value="' + esc(D.concept) + '"></div></div>';
   } else {
-    const cur = accCur(D.acc);
+    const cur = (D.type === "gasto" && isCard(D.acc) && D.cardCur === "USD") ? "USD" : accCur(D.acc);
     h += '<div class="field"><label for="f-amt">Monto' + (cur !== BASE() ? " en " + curPlural(cur) : "") + '</label><input id="f-amt" class="input amt-in ' + D.type + '" inputmode="decimal" autocomplete="off" placeholder="0,00" value="' + esc(D.amountText) + '"></div>';
     h += '<div class="field"><label for="f-concept">Concepto</label><input id="f-concept" class="input" maxlength="80" placeholder="' + (isT ? "Por ejemplo, ahorro del mes" : D.type === "ingreso" ? "Por ejemplo, sueldo de octubre" : "Por ejemplo, compra semanal") + '" value="' + esc(D.concept) + '"></div>';
     if (!isT) {
       const cats = S.config.categories.filter(c => c.type === D.type);
       h += '<div class="field"><span class="lbl">Categoría</span><div class="chips" style="flex-wrap:wrap">' + cats.map(c => '<button class="chip ' + (D.cat === c.id ? "on" : "") + '" data-a="f-cat" data-v="' + esc(c.id) + '"><i style="background:' + esc(c.color) + '"></i>' + esc(c.name) + '</button>').join("") + '</div></div>';
-      h += '<div class="two"><div class="field"><label for="f-acc">Cuenta</label><select id="f-acc" class="input">' + accOptions(D.acc) + '</select></div>';
+      h += '<div class="two"><div class="field"><label for="f-acc">Cuenta</label><select id="f-acc" class="input">' + accOptions(D.acc, x => !x.twinOf) + '</select></div>';
     } else {
       h += '<div class="two"><div class="field"><label for="f-acc">Desde</label><select id="f-acc" class="input">' + accOptions(D.acc) + '</select></div>' +
         '<div class="field"><label for="f-to">Hacia</label><select id="f-to" class="input">' + (accOptions(D.to, a => a.id !== D.acc && a.currency === cur) || '<option value="">Sin cuentas en ' + curPlural(cur) + '</option>') + '</select></div></div>' +
@@ -1815,7 +1900,9 @@ function movForm(){
     }
     h += '<div class="field"><label for="f-date">Fecha</label><input id="f-date" type="date" class="input" value="' + esc(D.date) + '"></div></div>';
     if (D.type === "gasto" && isCard(D.acc)) {
-      h += '<div class="field"><label for="f-cuotas">Cuotas</label><select id="f-cuotas" class="input">' + CUOTAS.map(n => '<option value="' + n + '"' + ((+D.cuotas || 1) === n ? " selected" : "") + '>' + (n === 1 ? "Un pago" : n + " cuotas") + '</option>').join("") + '</select>' +
+      if (BASE() !== "USD") h += '<div class="field"><span class="lbl">Moneda del consumo</span><div class="seg">' + [["base", cap(curPlural(BASE()))], ["USD", "Dólares"]].map(x => '<button class="' + ((D.cardCur === "USD" ? "USD" : "base") === x[0] ? "on" : "") + '" data-a="f-cardcur" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div></div>';
+      const cv = D.cuotas === "sub" ? "sub" : String(+D.cuotas || 1);
+      h += '<div class="field"><label for="f-cuotas">Forma de pago</label><select id="f-cuotas" class="input">' + ["1", "sub"].concat(CUOTAS.filter(n => n > 1).map(String)).map(n => '<option value="' + n + '"' + (cv === n ? " selected" : "") + '>' + (n === "1" ? "Un pago" : n === "sub" ? "Suscripción mensual" : n + " cuotas") + '</option>').join("") + '</select>' +
         '<small class="muted" id="f-cuo-info" style="display:block;margin-top:6px;font-size:13px">' + esc(cuotaInfo()) + '</small></div>';
     }
     if (isT && isCard(D.to)) {
@@ -1825,7 +1912,8 @@ function movForm(){
       h += '<div class="field"><label for="f-resumen">Es el pago del</label><select id="f-resumen" class="input"><option value="">No es un pago de resumen</option>' +
         opts.map(x => '<option value="' + x.key + '"' + (D.resumen === x.key ? " selected" : "") + '>Resumen de ' + esc(stmtName(x)) + ' (vence ' + shortDate(x.due) + ')</option>').join("") + '</select></div>';
     }
-    h += '<div class="field"><button class="toggle" data-a="f-repeat" role="switch" aria-checked="' + D.repeat + '"><span><b style="font-weight:500">Repetir cada mes</b><br><small class="muted">Te avisa para registrarlo el mismo día de cada mes</small></span><span class="sw ' + (D.repeat ? "on" : "") + '"></span></button></div>';
+    if (D.cuotas !== "sub" || !isCard(D.acc) || D.type !== "gasto") h += '<div class="field"><button class="toggle" data-a="f-repeat" role="switch" aria-checked="' + D.repeat + '"><span><b style="font-weight:500">Repetir cada mes</b><br><small class="muted">Te avisa para registrarlo el mismo día de cada mes</small></span><span class="sw ' + (D.repeat ? "on" : "") + '"></span></button></div>';
+    if (D.repeat && (D.cuotas !== "sub" || !isCard(D.acc))) h += '<div class="field"><button class="toggle" data-a="f-auto" role="switch" aria-checked="' + !!D.auto + '"><span><b style="font-weight:500">Cargarlo solo cada mes</b><br><small class="muted">Lo registra automáticamente ese día, sin preguntarte</small></span><span class="sw ' + (D.auto ? "on" : "") + '"></span></button></div>';
   }
   h += '<div class="err" id="f-err"></div>';
   h += '<div class="actions">' + (D.id ? '<button class="btn danger ' + (armed === "mov" ? "armed" : "") + '" data-a="f-del">' + (armed === "mov" ? "Confirmar" : "Eliminar") + '</button>' : "") + '<button class="btn green" data-a="f-save">' + (D.id ? "Guardar cambios" : "Guardar") + '</button></div>';
@@ -1833,10 +1921,12 @@ function movForm(){
 }
 function cuotaInfo(){
   const a = accById(D.acc); if (!a || a.kind !== "tarjeta") return "";
-  const n = +D.cuotas || 1, amt = parseAmount(D.amountText), s = stmtOf(a, D.date || iso(new Date()));
+  const cur = D.cardCur === "USD" ? "USD" : accCur(a.id), date = D.date || iso(new Date());
+  const n = +D.cuotas || 1, amt = parseAmount(D.amountText), s = stmtOf(a, date);
   const when = "el resumen de " + stmtName(s) + ", que vence el " + shortDate(s.due);
-  if (n === 1) return "Entra en " + when + ".";
-  return (amt > 0 ? n + " cuotas de " + fmtNum(amt / n, accCur(a.id)) + ". " : "") + "La primera entra en " + when + ". En “Tu mes” cuenta el total el día de la compra.";
+  if (D.cuotas === "sub") return "Se carga sola todos los meses el día " + fromISO(date).getDate() + " y aparece en cada resumen" + (cur === "USD" ? " en dólares" : "") + ". La primera entra en " + when + ".";
+  if (n === 1) return "Entra en " + when + (cur === "USD" ? ", en dólares" : "") + ".";
+  return (amt > 0 ? n + " cuotas de " + fmtNum(amt / n, cur) + ". " : "") + "La primera entra en " + when + ". En “Tu mes” cuenta el total el día de la compra.";
 }
 function formError(msg){ const e = $("#f-err"); if (e) e.textContent = msg; }
 
@@ -1855,6 +1945,7 @@ function saveCambio(){
     acc: venta ? D.fxAcc : D.baseAcc, to: venta ? D.baseAcc : D.fxAcc,
     amount: round2(venta ? fx : base), amountTo: round2(venta ? base : fx), rate: Math.round(rate * 10000) / 10000,
     date:D.date, rec:null, created:D.created || Date.now() };
+  if (D.resumen && isCard(mov.to)) mov.resumen = D.resumen;
   S.config.settings.rates[fxC] = mov.rate; persistConfig();
   upsertMov(mov, D._orig && D._orig.date);
   const edited = !!D.id;
@@ -1875,8 +1966,13 @@ function saveMov(){
   const mov = { id:D.id || newId(), type:D.type, amount:round2(amount), concept, cat:isT ? null : D.cat, acc:D.acc, to:isT ? D.to : null, date:D.date, rec:D.rec || null, created:D.created || Date.now() };
   if (D.type === "gasto" && isCard(D.acc) && +D.cuotas > 1) mov.cuotas = +D.cuotas;
   if (isT && isCard(D.to) && D.resumen) mov.resumen = D.resumen;
+  const isSub = D.type === "gasto" && isCard(D.acc) && D.cuotas === "sub";
+  if (isSub) { D.repeat = true; D.auto = true; }
+  if (!isT && D.type === "gasto" && isCard(D.acc) && D.cardCur === "USD" && BASE() !== "USD") mov.acc = ensureTwin(accById(D.acc)).id;
   if (D.repeat) {
-    const tpl = { id:mov.rec || newId(), type:mov.type, amount:mov.amount, concept, cat:mov.cat, acc:mov.acc, to:mov.to, day:fromISO(mov.date).getDate() };
+    const prevTpl = mov.rec ? S.config.recurrentes.find(r => r.id === mov.rec) : null;
+    const tpl = { id:mov.rec || newId(), type:mov.type, amount:mov.amount, concept, cat:mov.cat, acc:mov.acc, to:mov.to, day:fromISO(mov.date).getDate(),
+      auto:!!D.auto, sub:isSub, since:(prevTpl && prevTpl.since) || mov.date.slice(0, 7) };
     const i = S.config.recurrentes.findIndex(r => r.id === tpl.id);
     if (i >= 0) S.config.recurrentes[i] = tpl; else S.config.recurrentes.push(tpl);
     mov.rec = tpl.id; persistConfig();
@@ -1891,6 +1987,41 @@ function saveMov(){
   closeSheet(); render();
   const bmsg = budgetMsg(mov);
   toast(bmsg || (edited ? "Cambios guardados" : (mov.type === "ingreso" ? "Ingreso registrado" : mov.type === "gasto" ? "Gasto registrado" : "Transferencia registrada")));
+}
+
+/* total del resumen del banco */
+function adjMov(cardId, key){ return allMovs().find(m => m.acc === cardId && m.ajusteResumen === key); }
+function openAdjust(cardId, key){
+  const a = accById(cardId); if (!a) return;
+  const st = cardStatements(a).find(x => x.key === key);
+  D = { card:cardId, key, totalText:st && st.total > 0.005 ? fmtIn(st.total) : "" };
+  openSheet(adjustForm);
+}
+function adjustForm(){
+  const a = accById(D.card), p = D.key.split("-").map(Number), s = stmtAt(a, p[0], p[1] - 1);
+  const st = cardStatements(a).find(x => x.key === D.key), adj = adjMov(D.card, D.key);
+  const loaded = round2((st ? st.total : 0) - (adj ? (adj.type === "ingreso" ? -adj.amount : adj.amount) : 0));
+  return sheetHead("Resumen de " + esc(stmtName(s))) +
+    '<p class="muted" style="margin:0;font-size:15px">Poné el total que figura en tu resumen (cerró el ' + shortDate(s.close) + ' y vence el ' + shortDate(s.due) + '). Pulso agrega la diferencia con lo que ya tenés cargado, sin contarla como gasto de este mes.</p>' +
+    '<div class="field"><label for="f-total">Total del resumen</label><input id="f-total" class="input amt-in" inputmode="decimal" placeholder="0,00" value="' + esc(D.totalText) + '"></div>' +
+    '<p class="credit" style="margin-top:8px">Ya cargado en Pulso para este resumen: ' + fmtNum(loaded, accCur(a.id)) + '.</p>' +
+    '<div class="err" id="f-err"></div><div class="actions">' + (adj ? '<button class="btn danger" data-a="f-del-adj">Quitar ajuste</button>' : "") + '<button class="btn green" data-a="f-save-adj">Guardar</button></div>';
+}
+function saveAdjust(){
+  syncDraft();
+  const a = accById(D.card); if (!a) return closeSheet();
+  const T = parseAmount(D.totalText);
+  if (isNaN(T) || T < 0) return formError("Ingresá el total del resumen.");
+  const p = D.key.split("-").map(Number), s = stmtAt(a, p[0], p[1] - 1);
+  const st = cardStatements(a).find(x => x.key === D.key), adj = adjMov(D.card, D.key);
+  const loaded = round2((st ? st.total : 0) - (adj ? (adj.type === "ingreso" ? -adj.amount : adj.amount) : 0)), diff = round2(T - loaded);
+  if (adj) removeMov(adj);
+  if (Math.abs(diff) >= 0.01) {
+    upsertMov({ id:(adj && adj.id) || newId(), type:diff > 0 ? "gasto" : "ingreso", previo:true, ajusteResumen:D.key, desde:D.key, cuotas:1, amount:Math.abs(diff),
+      concept:diff > 0 ? "Otros consumos del resumen de " + stmtName(s) : "Ajuste del resumen de " + stmtName(s), cat:diff > 0 ? "otros-g" : "otros-i",
+      acc:a.id, to:null, date:iso(s.close), rec:null, created:Date.now() });
+  }
+  UI.stOpen = D.key; closeSheet(); render(); toast("Resumen de " + stmtName(s) + ": " + fmtNum(T, accCur(a.id)));
 }
 
 /* cuotas que ya venías pagando */
@@ -1908,7 +2039,7 @@ function openPrevioForm(m, cardId){
 function previoInfo(){
   const a = accById(D.acc); if (!a) return "";
   const v = parseAmount(D.valorText), n = Math.round(+D.totalN), k = Math.round(+D.nextN);
-  if (!(n >= 1) || !(k >= 1) || k > n) return "Mirá tu último resumen: si dice 04/12 y ya lo pagaste, la próxima cuota es la 5.";
+  if (!(n >= 1) || !(k >= 1) || k > n) return "Mirá el último resumen que te llegó, aunque todavía no lo hayas pagado: si dice 04/12, la próxima cuota es la 5.";
   const rem = n - k + 1, first = stmtOf(a, (D._orig && D._orig.date) || iso(new Date())), last = stmtAt(a, first.y, first.m + rem - 1);
   return "Quedan " + rem + (rem === 1 ? " cuota" : " cuotas") + ", del resumen de " + stmtName(first) + " al de " + stmtName(last) + "." +
     (v > 0 ? " Total pendiente: " + fmtNum(v * rem, accCur(a.id)) + "." : "");
@@ -2142,7 +2273,7 @@ function buildWorkbook(){
   const base = BASE();
   const H = v => ({v, s:1}), T = v => ({v}), M = v => ({v:round2(v), s:3}), MB = v => ({v:round2(v), s:5});
   const tl = {gasto:"Gasto", ingreso:"Ingreso", transfer:"Transferencia", cambio:"Cambio de moneda"};
-  const cuotaTxt = m => m.previo ? "Cuotas " + m.cuotaIni + " a " + m.cuotas + " pendientes" : (+m.cuotas > 1 ? m.cuotas + " cuotas" : "");
+  const cuotaTxt = m => m.ajusteResumen ? "" : m.previo ? "Cuotas " + m.cuotaIni + " a " + m.cuotas + " pendientes" : (+m.cuotas > 1 ? m.cuotas + " cuotas" : "");
   const movs = allMovs().slice().sort((a, b) => a.date.localeCompare(b.date) || (a.created || 0) - (b.created || 0));
 
   const r1 = [[H("Fecha"), H("Tipo"), H("Concepto"), H("Categoría"), H("Cuenta"), H("Moneda"), H("Monto"), H("Cuenta destino"), H("Moneda destino"), H("Monto destino"), H("Cotización"), H("Monto en " + base), H("Cuotas"), H("Mensual")]];
@@ -2150,7 +2281,7 @@ function buildWorkbook(){
     const c = accCur(m.acc), out = m.type === "gasto" || m.type === "transfer" || m.type === "cambio";
     const signed = out ? -m.amount : m.amount;
     const toAmt = m.to ? (m.amountTo != null ? m.amountTo : m.amount) : null;
-    r1.push([{v:excelDate(m.date), s:2}, T(m.previo ? "Cuotas previas" : (tl[m.type] || m.type)), T(m.concept || ""), T(m.type === "gasto" || m.type === "ingreso" ? catName(m.cat) : ""),
+    r1.push([{v:excelDate(m.date), s:2}, T(m.ajusteResumen ? "Ajuste de resumen" : m.previo ? "Cuotas previas" : (tl[m.type] || m.type)), T(m.concept || ""), T(m.type === "gasto" || m.type === "ingreso" ? catName(m.cat) : ""),
       T(accName(m.acc)), T(c), M(signed), T(m.to ? accName(m.to) : ""), T(m.to ? accCur(m.to) : ""), toAmt != null ? M(toAmt) : null,
       m.type === "cambio" ? {v:m.rate, s:3} : null, (m.type === "gasto" || m.type === "ingreso") && !m.previo ? M(toBase(signed, c)) : null, T(cuotaTxt(m)), T(m.rec ? "Sí" : "")]);
   });
@@ -2182,8 +2313,8 @@ function buildWorkbook(){
   cards().forEach(a => {
     const cv = cardView(a), c = accCur(a.id);
     cv.list.forEach(st => {
-      r5.push([T(a.name), {v:excelDate(st.key + "-01"), s:7}, {v:excelDate(iso(st.s.close)), s:2}, {v:excelDate(iso(st.s.due)), s:2}, T(c), M(st.total), M(st.paid), M(st.pend), T(est[st.state] || "")]);
-      st.lines.forEach(q => r6.push([T(a.name), {v:excelDate(st.key + "-01"), s:7}, {v:excelDate(iso(st.s.due)), s:2}, T(q.mov.concept || ""), T(q.mov.type === "transfer" ? "" : catName(q.mov.cat)),
+      r5.push([T(a.name), {v:excelDate(iso(new Date(st.s.due.getFullYear(), st.s.due.getMonth(), 1))), s:7}, {v:excelDate(iso(st.s.close)), s:2}, {v:excelDate(iso(st.s.due)), s:2}, T(c), M(st.total), M(st.paid), M(st.pend), T(est[st.state] || "")]);
+      st.lines.forEach(q => r6.push([T(a.name), {v:excelDate(iso(new Date(st.s.due.getFullYear(), st.s.due.getMonth(), 1))), s:7}, {v:excelDate(iso(st.s.due)), s:2}, T((q.mov.concept || "") + (q.proj ? " (estimado)" : "")), T(q.mov.type === "transfer" ? "" : catName(q.mov.cat)),
         T(q.n > 1 ? q.num + "/" + q.n : "1/1"), T(c), M(q.sign * q.amount)]));
     });
   });
@@ -2283,7 +2414,21 @@ const A = {
   "tab": el => { UI.tab = el.dataset.tab; armed = null; render(); window.scrollTo(0, 0); },
   "new-mov": () => openMovForm(null),
   "new-mov-day": el => openMovForm(null, {date:el.dataset.v}),
-  "edit-mov": el => { const m = findMov(el.dataset.id); if (!m) return; if (m.previo) openPrevioForm(m); else openMovForm(m); },
+  "edit-mov": el => { const m = findMov(el.dataset.id); if (!m) return; if (m.ajusteResumen) openAdjust(m.acc, m.ajusteResumen); else if (m.previo) openPrevioForm(m); else openMovForm(m); },
+  "card-adj": el => openAdjust(UI.card, el.dataset.v),
+  "card-sub": () => openMovForm(null, { type:"gasto", acc:UI.card, cuotas:"sub" }),
+  "card-pay-usd": el => {
+    const a = accById(UI.card); if (!a) return;
+    const t = twinOf(a), x = mergedCard(a).list.find(k => k.key === el.dataset.v); if (!t || !x) return;
+    const from = bestAcc(acc => acc.currency === "USD" && acc.kind !== "tarjeta" && acc.kind !== "objetivo");
+    const concept = "Pago dólares resumen " + a.name + " de " + stmtName(x.s);
+    if (from) openMovForm(null, { type:"transfer", acc:from, to:t.id, amountText:fmtIn(x.pendUsd), concept, resumen:x.key });
+    else openMovForm(null, { type:"cambio", dir:"compra", fxAcc:t.id, fxText:fmtIn(x.pendUsd), concept, resumen:x.key });
+  },
+  "f-cardcur": el => { syncDraft(); D.cardCur = el.dataset.v === "USD" ? "USD" : null; renderSheet(); },
+  "f-auto": () => { syncDraft(); D.auto = !D.auto; renderSheet(); },
+  "f-save-adj": () => saveAdjust(),
+  "f-del-adj": () => { const adj = adjMov(D.card, D.key); if (adj) removeMov(adj); closeSheet(); render(); toast("Ajuste quitado"); },
   "close-sheet": () => closeSheet(),
   "toggle-hide": () => { prefs.hidden = !prefs.hidden; savePrefs(); render(); },
   "goto-ajustes": () => { UI.tab = "ajustes"; render(); window.scrollTo(0, 0); },
@@ -2315,7 +2460,7 @@ const A = {
     renderSheet(); },
   "f-dir": el => { syncDraft(); D.dir = el.dataset.v; renderSheet(); },
   "f-cat": el => { syncDraft(); D.cat = el.dataset.v; renderSheet(); },
-  "f-repeat": () => { syncDraft(); D.repeat = !D.repeat; renderSheet(); },
+  "f-repeat": () => { syncDraft(); D.repeat = !D.repeat; if (!D.repeat) D.auto = false; renderSheet(); },
   "f-save": () => saveMov(),
   "f-del": () => { if (armed !== "mov") { armed = "mov"; syncDraft(); renderSheet(); return; } removeMov(D._orig); closeSheet(); render(); toast("Movimiento eliminado"); },
   "f-save-acc": () => saveAcc(),
