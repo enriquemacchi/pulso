@@ -265,6 +265,14 @@ button.item:active{background:var(--rule-2)}
 .reserve p{margin:10px 0 0;font-size:14px;font-weight:600}
 .stack{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--rule-2);margin-top:8px}
 .stack i{display:block;height:100%}
+.bar.budget{position:relative;height:7px;margin-top:7px;overflow:visible}
+.bar.budget>i{border-radius:4px;max-width:100%}
+.bar.budget em{position:absolute;top:-3px;width:2px;height:13px;margin-left:-1px;background:var(--ink);opacity:.5;border-radius:1px}
+.metric.wide{grid-column:1/-1}
+.ledger.quotes::before{display:none}
+.quotes .row{grid-template-columns:minmax(0,1fr) auto auto;gap:0 16px}
+.quotes .row small{display:block;font-size:11px;color:var(--ink-3);text-align:right}
+.credit{font-size:12px;color:var(--ink-3);margin:10px 2px 0}
 .loading{min-height:60vh;display:grid;place-items:center;color:var(--ink-2)}
 .toast{position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom,0px));transform:translate(-50%,20px);background:var(--ink);color:var(--paper);padding:10px 16px;border-radius:12px;font-size:14px;font-weight:500;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:60;max-width:calc(100% - 32px)}
 .toast.show{opacity:1;transform:translate(-50%,0)}
@@ -637,6 +645,115 @@ function combinar(a, b) {
   };
 }
 
+/* ---------- cotizaciones (DolarApi) e inflación (INDEC vía ArgentinaDatos) ---------- */
+const MKT_KEY = "pulso:mercado";
+const CASAS = [["oficial","Oficial"],["blue","Blue"],["bolsa","MEP"],["contadoconliqui","Contado con liqui"],["tarjeta","Tarjeta"],["mayorista","Mayorista"],["cripto","Cripto"]];
+const casaName = c => (CASAS.find(x => x[0] === c) || [c, c])[1];
+function market(){ try { return JSON.parse(localStorage.getItem(MKT_KEY) || "{}") || {}; } catch (e) { return {}; } }
+function mergeMarket(n){
+  if (!n || typeof n !== "object") return false;
+  const m = market(); let ch = false;
+  if (Array.isArray(n.dolares) && n.dolares.length && (n.dolaresAt || 0) > (m.dolaresAt || 0)) { m.dolares = n.dolares; m.dolaresAt = n.dolaresAt; ch = true; }
+  if (Array.isArray(n.inflacion) && n.inflacion.length && (n.inflacionAt || 0) > (m.inflacionAt || 0)) { m.inflacion = n.inflacion; m.inflacionAt = n.inflacionAt; ch = true; }
+  if (ch) { try { localStorage.setItem(MKT_KEY, JSON.stringify(m)); } catch (e) {} }
+  return ch;
+}
+async function fetchMarketDirect(force){
+  const m = market(), now = Date.now(), out = {};
+  const get = async url => {
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const t = setTimeout(() => { if (ctrl) ctrl.abort(); }, 12000);
+    try { const r = await fetch(url, { signal:ctrl ? ctrl.signal : undefined }); if (!r.ok) throw new Error("http"); return await r.json(); }
+    finally { clearTimeout(t); }
+  };
+  if (force || now - (m.dolaresAt || 0) > 30 * 60000) {
+    try { const d = await get("https://dolarapi.com/v1/dolares"); out.dolares = d.map(x => ({ casa:x.casa, nombre:x.nombre, compra:x.compra, venta:x.venta, fecha:x.fechaActualizacion })); out.dolaresAt = now; } catch (e) {}
+  }
+  if (force || now - (m.inflacionAt || 0) > 12 * 3600000) {
+    try { const d = await get("https://api.argentinadatos.com/v1/finanzas/indices/inflacion"); out.inflacion = d.slice(-60).map(x => [String(x.fecha).slice(0, 7), +x.valor]); out.inflacionAt = now; } catch (e) {}
+  }
+  if (mergeMarket(out)) { applyAutoRate(); render(); }
+}
+function autoQuote(){
+  const a = S.config.settings.dolarAuto;
+  if (!a || !a.casa) return null;
+  const d = (market().dolares || []).find(x => x.casa === a.casa);
+  if (!d) return null;
+  const v = +(a.lado === "compra" ? d.compra : d.venta);
+  return v > 0 ? { v, d } : null;
+}
+function applyAutoRate(){
+  if (BASE() === "USD") return false;
+  const q = autoQuote(); if (!q) return false;
+  const rates = S.config.settings.rates || (S.config.settings.rates = {});
+  if (Math.abs((+rates.USD || 0) - q.v) > 0.0001) { rates.USD = q.v; saveLocal(); return true; }
+  return false;
+}
+function inflData(){
+  const s = (market().inflacion || []).filter(x => Array.isArray(x) && x.length === 2 && isFinite(+x[1]));
+  const idx = {}; let v = 1;
+  s.forEach(x => { v *= 1 + (+x[1]) / 100; idx[x[0]] = v; });
+  return { s, idx, last:s.length ? s[s.length - 1] : null };
+}
+const inflOn = () => BASE() === "ARS" && !!inflData().last;
+function realFactor(ym, inf){ inf = inf || inflData(); if (!inf.last || !inf.idx[ym]) return 1; return inf.idx[inf.last[0]] / inf.idx[ym]; }
+const ymName = ym => MESES[+ym.slice(5) - 1] + " " + ym.slice(0, 4);
+function inflYear(inf){ const l = inf.s.slice(-12); return l.length === 12 ? l.reduce((a, x) => a * (1 + x[1] / 100), 1) - 1 : null; }
+const hhmm = t => { const d = new Date(t); return pad(d.getHours()) + ":" + pad(d.getMinutes()); };
+
+/* ---------- presupuestos por categoría ---------- */
+function catSpentMap(p){ const by = {}; catBreakdown(movsBetween(p.start, p.end)).forEach(c => by[c.id] = c.total); return by; }
+function budgetRows(){
+  const p = periodOf(new Date()), spent = catSpentMap(p);
+  return S.config.categories.filter(c => c.type === "gasto" && +c.tope > 0).map(c => { const g = spent[c.id] || 0; return { c, tope:+c.tope, gastado:g, usado:g / c.tope }; });
+}
+function avgSpent(catId, n){
+  let s = 0, used = 0;
+  for (let k = 1; k <= n; k++) {
+    const p = periodOf(new Date(), -k), list = movsBetween(p.start, p.end);
+    if (!list.length) continue;
+    used++;
+    const b = catBreakdown(list).find(x => x.id === catId); s += b ? b.total : 0;
+  }
+  return used ? s / used : 0;
+}
+function budgetMsg(m){
+  if (!m || m.type !== "gasto" || m.previo) return "";
+  const c = catById(m.cat); if (!c || !(+c.tope > 0)) return "";
+  const p = periodOf(new Date());
+  if (m.date < iso(p.start) || m.date >= iso(p.end)) return "";
+  const g = catSpentMap(p)[c.id] || 0, u = g / c.tope;
+  if (u >= 1) return "Te pasaste " + money(g - c.tope) + " del presupuesto de " + c.name;
+  if (u >= 0.8) return c.name + ": usaste el " + pct(u) + " del presupuesto";
+  return "";
+}
+function openBudgets(){ D = {}; openSheet(budgetForm); }
+function budgetForm(){
+  const cats = S.config.categories.filter(c => c.type === "gasto"), spent = catSpentMap(periodOf(new Date()));
+  return sheetHead("Presupuestos del mes") +
+    '<p class="muted" style="margin:0;font-size:14px">Cuánto querés gastar como máximo por mes en cada categoría. Dejá vacías las que no quieras controlar.</p>' +
+    cats.map(c => {
+      const avg = avgSpent(c.id, 3);
+      return '<div class="field"><label for="b-' + esc(c.id) + '"><span class="dot" style="display:inline-block;margin-right:8px;background:' + esc(c.color) + '"></span>' + esc(c.name) + '</label>' +
+        '<input id="b-' + esc(c.id) + '" data-bud="' + esc(c.id) + '" class="input" inputmode="decimal" placeholder="Sin tope" value="' + esc(c.tope ? fmtIn(c.tope) : "") + '">' +
+        '<small class="muted" style="display:block;margin-top:5px;font-size:12px">Este mes llevás ' + fmtNum(spent[c.id] || 0) + (avg > 0 ? ". Promedio mensual de los meses anteriores: " + fmtNum(avg) : "") + '.</small></div>';
+    }).join("") +
+    '<div class="err" id="f-err"></div><div class="actions"><button class="btn green" data-a="f-save-budgets">Guardar</button></div>';
+}
+function saveBudgets(){
+  const vals = [];
+  for (const el of $$("[data-bud]")) {
+    const c = catById(el.dataset.bud); if (!c) continue;
+    const t = el.value.trim();
+    if (!t) { vals.push([c, null]); continue; }
+    const v = parseAmount(t);
+    if (!(v > 0)) return formError("Revisá el tope de " + c.name + ".");
+    vals.push([c, round2(v)]);
+  }
+  vals.forEach(([c, v]) => { if (v == null) delete c.tope; else c.tope = v; });
+  persistConfig(); closeSheet(); render(); toast("Presupuestos guardados");
+}
+
 /* ---------- sincronización con Google (opcional) ---------- */
 const SY = { busy:false, again:false, gen:0, state:"", timer:null, lastTry:0 };
 function syncCfg(){ try { const c = JSON.parse(localStorage.getItem(SYNC_KEY) || "null"); return c && c.url && c.key ? c : null; } catch (e) { return null; } }
@@ -703,10 +820,12 @@ async function syncNow(){
     if (!j || !j.ok) throw { code:(j && j.error) || "respuesta" };
     if (stamp()) SY.gen++;
     applyDoc(combinar(JSON.parse(JSON.stringify(j.datos || {})), toDoc()));
+    const mk = mergeMarket(j.mercado);
+    applyAutoRate();
     const cc = syncCfg(); if (cc) { cc.last = Date.now(); setSyncCfg(cc); }
     ok = true;
     if (SY.gen !== gen) SY.again = true;
-    if (JSON.stringify(toDoc()) !== before) render();
+    if (mk || JSON.stringify(toDoc()) !== before) render();
     setSyncState("ok");
     try {
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -786,7 +905,8 @@ function init(){
   Sync.mode = "local";
   render();
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
-  if (syncCfg()) syncNow();
+  if (syncCfg()) syncNow(); else fetchMarketDirect();
+  setInterval(() => { if (document.visibilityState === "visible" && !syncCfg()) fetchMarketDirect(); }, 30 * 60000);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && syncCfg() && Date.now() - SY.lastTry > 15000) syncNow(); });
   window.addEventListener("online", () => { if (syncCfg()) syncNow(); });
   setInterval(() => { if (document.visibilityState === "visible" && syncCfg() && SY.state !== "clave") syncNow(); }, 120000);
@@ -912,6 +1032,21 @@ function viewInicio(){
   const listAccs = S.config.accounts.filter(a => ["disponible", "reserva"].indexOf(roleFor(a)) >= 0);
   h += listAccs.map(a => '<button class="row" data-a="acc-movs" data-id="' + esc(a.id) + '"><span class="dot sq" style="background:var(--ink-2)"></span><span class="t"><b>' + esc(a.name) + '</b><span class="meta"><span>' + esc(KINDS[a.kind] || "Cuenta") + '</span>' + (a.currency !== BASE() ? '<span>' + esc(cap(curPlural(a.currency))) + '</span>' : "") + '</span></span><span class="r"><b class="amt ' + (bal[a.id] < 0 ? "neg" : "") + '">' + money(bal[a.id], false, a.currency) + '</b></span></button>').join("") || '<div class="row"><span></span><span class="muted">No tenés cuentas.</span><span></span></div>';
   h += '</div>';
+
+  const brs = budgetRows();
+  h += '<div class="sec"><h2>Presupuestos</h2><button class="link" data-a="budgets">' + (brs.length ? "Editar" : "Crear") + '</button></div>';
+  if (brs.length) {
+    const bp = periodOf(new Date()), now0 = new Date(), td = new Date(now0.getFullYear(), now0.getMonth(), now0.getDate());
+    const totD = daysBetween(bp.start, bp.end), pace = Math.min(1, (daysBetween(bp.start, td) + 1) / totD);
+    h += '<div class="ledger">' + brs.sort((a, b) => b.usado - a.usado).map(b => {
+      const col = b.usado >= 1 ? "var(--red)" : b.usado >= 0.8 ? "var(--gold)" : "var(--green)", rest = b.tope - b.gastado;
+      return '<button class="row" data-a="budget-movs" data-id="' + esc(b.c.id) + '"><span class="dot" style="background:' + esc(b.c.color) + '"></span><span class="t"><b>' + esc(b.c.name) + '</b>' +
+        '<span class="bar budget" style="display:block"><i style="width:' + Math.min(100, b.usado * 100).toFixed(1) + '%;background:' + col + '"></i><em style="left:' + (pace * 100).toFixed(1) + '%"></em></span></span>' +
+        '<span class="r"><b class="amt">' + money(b.gastado) + '</b><small class="' + (rest < 0 ? "neg" : "") + '">' + (rest >= 0 ? "Quedan " + money(rest) : "Te pasaste " + money(-rest)) + '</small></span></button>';
+    }).join("") + '</div><p class="credit">La rayita de cada barra marca cuánto del mes ya pasó: si la barra la supera, vas más rápido de lo previsto.</p>';
+  } else {
+    h += '<div class="empty"><p>Poné un tope mensual a las categorías que querés cuidar y vas a ver cuánto te queda en cada una.</p><button class="btn ghost small" data-a="budgets">Crear presupuestos</button></div>';
+  }
 
   const cs = cards();
   if (cs.length) {
@@ -1083,6 +1218,15 @@ function anResumen(){
   const cg = totals(list).gas;
   if (pt.gas) { const d = (cg - pt.gas) / pt.gas; if (Math.abs(d) >= 0.01) lines.push("Gastaste un " + Math.abs(Math.round(d * 100)) + "% " + (d < 0 ? "menos" : "más") + " que " + (inProgress ? "a esta altura del periodo anterior." : "en el periodo anterior.")); }
   if (proj != null && t.ing) lines.push("A este ritmo cerrarías el mes con un balance de " + money(t.ing - proj, true) + ".");
+  const inf = inflData();
+  if (inflOn() && UI.anRange === "mes" && pt.gas) {
+    const d = (cg - pt.gas) / pt.gas, r = inf.last[1] / 100, real = (1 + d) / (1 + r) - 1;
+    lines.push("Descontando la inflación de " + ymName(inf.last[0]) + " (" + String(inf.last[1]).replace(".", ",") + "%), gastaste un " + Math.abs(Math.round(real * 100)) + "% " + (real < 0 ? "menos" : "más") + " en términos reales.");
+  }
+  if (inflOn()) {
+    const iy = inflYear(inf);
+    h += '<div class="metrics"><div class="metric wide"><span>Inflación (INDEC)</span><b>' + String(inf.last[1]).replace(".", ",") + '% en ' + esc(ymName(inf.last[0])) + '</b><small>' + (iy != null ? "Últimos 12 meses: " + pct(iy) + ". " : "") + "Fuente: INDEC." + '</small></div></div>';
+  }
   if (lines.length) h += '<div class="sec"><h2>Lo importante</h2></div><div class="reading">' + lines.map(l => "<p>" + esc(l) + "</p>").join("") + '</div>';
 
   if (cats.length) {
@@ -1107,6 +1251,14 @@ function anPatrimonio(){
   h += '</div>';
   const missing = fcs.filter(c => !rateOf(c));
   if (missing.length) h += '<div class="notice"><p>Cargá la cotización del ' + missing.map(c => curInfo(c)[0].toLowerCase()).join(" y del ") + ' para sumar esas cuentas a tu patrimonio.</p><button class="btn small" data-a="goto-ajustes">Cargar</button></div>';
+  const mk = market();
+  if (BASE() === "ARS" && (mk.dolares || []).length) {
+    const sel = (S.config.settings.dolarAuto || {}).casa;
+    h += '<div class="sec"><h2>Dólar hoy</h2><small>' + (mk.dolaresAt ? "A las " + hhmm(mk.dolaresAt) : "") + '</small></div><div class="ledger quotes">' +
+      CASAS.map(c => mk.dolares.find(x => x.casa === c[0])).filter(Boolean).map(x => '<div class="row"><span class="t"><b>' + esc(casaName(x.casa)) + (x.casa === sel ? ' <span class="pillst ok">En uso</span>' : "") + '</b></span>' +
+        '<span class="r"><small>Compra</small><b class="amt">' + (x.compra ? fmtNum(x.compra) : "—") + '</b></span><span class="r"><small>Venta</small><b class="amt">' + (x.venta ? fmtNum(x.venta) : "—") + '</b></span></div>').join("") +
+      '</div><p class="credit">Fuente: DolarApi.</p>';
+  }
   parts.forEach(x => {
     if (!x.accs.length) return;
     h += '<div class="sec"><h2>' + esc(x.g[1]) + '</h2><small class="amt">' + money(x.v) + '</small></div><div class="ledger">' + x.accs.map(a => {
@@ -1138,11 +1290,11 @@ function saveValue(){
 }
 
 function anHistorico(){
-  const y = UI.histYear;
+  const y = UI.histYear, inf = inflData(), real = UI.histReal && inflOn();
   const rows = [];
   for (let m = 0; m < 12; m++) {
-    const t = totals(movsBetween(new Date(y, m, 1), new Date(y, m + 1, 1)));
-    rows.push({m, ing:t.ing, gas:t.gas, net:t.net});
+    const t = totals(movsBetween(new Date(y, m, 1), new Date(y, m + 1, 1))), f = real ? realFactor(y + "-" + pad(m + 1), inf) : 1;
+    rows.push({m, ing:round2(t.ing * f), gas:round2(t.gas * f), net:round2(t.net * f)});
   }
   const max = Math.max(1, ...rows.map(r => Math.max(r.ing, r.gas)));
   const W_ = 340, H_ = 170, base = 140, gw = W_ / 12;
@@ -1156,10 +1308,13 @@ function anHistorico(){
     svg += '<text x="' + x.toFixed(1) + '" y="' + (base + 18) + '" text-anchor="middle" font-size="11" fill="var(--ink-3)" font-family="inherit">' + MESES[i].charAt(0).toUpperCase() + '</text>';
   });
   svg += '<line x1="0" x2="' + W_ + '" y1="' + base + '" y2="' + base + '" stroke="var(--rule)"/></svg>';
-  const yt = totals(movsBetween(new Date(y, 0, 1), new Date(y + 1, 0, 1)));
+  const yt = { ing:sum(rows.map(r => r.ing)), gas:sum(rows.map(r => r.gas)) };
 
-  let h = '<div class="nav"><button class="iconbtn" data-a="hist-prev" aria-label="Año anterior">' + ic("left") + '</button><b>' + y + '</b><button class="iconbtn" data-a="hist-next" aria-label="Año siguiente">' + ic("right") + '</button></div>';
+  let h = '';
+  if (inflOn()) h += '<div class="chips" style="margin-bottom:10px"><button class="chip ' + (!real ? "on" : "") + '" data-a="hist-real" data-v="0">En pesos de cada mes</button><button class="chip ' + (real ? "on" : "") + '" data-a="hist-real" data-v="1">Sin inflación</button></div>';
+  h += '<div class="nav"><button class="iconbtn" data-a="hist-prev" aria-label="Año anterior">' + ic("left") + '</button><b>' + y + '</b><button class="iconbtn" data-a="hist-next" aria-label="Año siguiente">' + ic("right") + '</button></div>';
   h += '<div class="chart"><div class="legend"><span><i style="background:var(--green)"></i>Ingresos</span><span><i style="background:var(--red)"></i>Gastos</span></div>' + svg + '</div>';
+  if (real) h += '<p class="credit" style="margin:-4px 2px 10px">Montos llevados a pesos de ' + esc(ymName(inf.last[0])) + ' con el IPC del INDEC. Los meses sin dato publicado quedan como están.</p>';
   h += '<div class="metrics"><div class="metric"><span>Ingresos del año</span><b class="amt">' + money(yt.ing) + '</b></div><div class="metric"><span>Gastos del año</span><b class="amt">' + money(yt.gas) + '</b></div></div>';
   const visible = rows.filter(r => r.ing || r.gas);
   h += '<div class="sec"><h2>Detalle mensual</h2>' + ((+S.config.settings.monthStart || 1) !== 1 ? '<small>Meses calendario</small>' : "") + '</div>';
@@ -1237,6 +1392,17 @@ function viewTarjetas(){
   return h;
 }
 
+function usdRateItems(){
+  const a = S.config.settings.dolarAuto, q = autoQuote(), m = market();
+  let h = '<label class="item"><span class="l"><span><b>Cotización del dólar</b><small>' +
+    (a && a.casa ? (q ? "Automática: " + fmtNum(q.v) + ", actualizada " + (m.dolaresAt ? "a las " + hhmm(m.dolaresAt) : "") : "Automática: esperando la primera cotización") : "Manual: la cargás vos o se toma de tu último cambio de moneda") +
+    '</small></span></span><select data-ch="dolarAuto"><option value="manual"' + (!a || !a.casa ? " selected" : "") + '>Manual</option>' +
+    CASAS.map(x => '<option value="' + x[0] + '"' + (a && a.casa === x[0] ? " selected" : "") + '>' + x[1] + '</option>').join("") + '</select></label>';
+  if (a && a.casa) h += '<label class="item"><span class="l"><span><b>Precio que usa</b><small>Venta es lo que pagás al comprar dólares</small></span></span><select data-ch="dolarLado"><option value="venta"' + (a.lado !== "compra" ? " selected" : "") + '>Venta</option><option value="compra"' + (a.lado === "compra" ? " selected" : "") + '>Compra</option></select></label>';
+  else h += '<label class="item"><span class="l"><span><b>Dólar de referencia</b><small>' + curSym(BASE()) + ' por cada US$</small></span></span><input class="input rate-in" data-rate="USD" inputmode="decimal" placeholder="Sin cargar" value="' + (rateOf("USD") ? fmtIn(rateOf("USD"), 4) : "") + '"></label>';
+  return h;
+}
+
 /* ajustes */
 let armed = null;
 function viewAjustes(){
@@ -1260,6 +1426,7 @@ function viewAjustes(){
   h += '<div class="group">' + cg.map(catItem).join("") + '<button class="item add" data-a="new-cat" data-v="gasto">Añadir categoría de gasto</button></div>';
   h += '<div class="group" style="margin-top:10px">' + ci.map(catItem).join("") + '<button class="item add" data-a="new-cat" data-v="ingreso">Añadir categoría de ingreso</button></div>';
 
+  h += '<div class="sec"><h2>Presupuestos</h2></div><div class="group"><button class="item add" data-a="budgets">' + (budgetRows().length ? "Editar presupuestos del mes" : "Crear presupuestos del mes") + '</button></div>';
   h += '<div class="sec"><h2>Movimientos mensuales</h2></div><div class="group">' + (S.config.recurrentes.length ? S.config.recurrentes.map(r =>
     '<div class="item"><span class="l"><span><b>' + esc(r.concept || catName(r.cat)) + '</b><small>Día ' + r.day + ', ' + esc(accName(r.acc)) + '</small></span></span><span class="l"><span class="amt ' + (r.type === "ingreso" ? "pos" : r.type === "gasto" ? "neg" : "") + '">' + money(r.type === "gasto" ? -r.amount : r.amount, r.type !== "transfer", accCur(r.acc)) + '</span><button class="x ' + (armed === "rec:" + r.id ? "armed" : "") + '" data-a="del-rec" data-id="' + esc(r.id) + '" aria-label="Dejar de repetir">' + ic("x", 16) + '</button></span></div>').join("")
     : '<div class="item"><span class="muted" style="font-size:14px">Activá “Repetir cada mes” al registrar un movimiento, como el sueldo o el alquiler.</span></div>') + '</div>';
@@ -1267,7 +1434,7 @@ function viewAjustes(){
   const curOpts = [["ARS","Peso argentino"],["USD","Dólar"],["EUR","Euro"],["UYU","Peso uruguayo"],["CLP","Peso chileno"],["MXN","Peso mexicano"]];
   h += '<div class="sec"><h2>Preferencias</h2></div><div class="group">' +
     '<label class="item"><span class="l"><span><b>Moneda principal</b><small>Para el patrimonio, los totales y el análisis</small></span></span><select data-ch="currency">' + curOpts.map(o => '<option value="' + o[0] + '"' + (st.currency === o[0] ? " selected" : "") + '>' + o[1] + '</option>').join("") + '</select></label>' +
-    foreignCurs().map(c => '<label class="item"><span class="l"><span><b>Cotización del ' + esc(curInfo(c)[0].toLowerCase()) + '</b><small>' + curSym(BASE()) + ' por cada ' + curSym(c) + '. Se actualiza con tu último cambio de moneda.</small></span></span><input class="input rate-in" data-rate="' + c + '" inputmode="decimal" placeholder="Sin cargar" value="' + (rateOf(c) ? fmtIn(rateOf(c), 4) : "") + '"></label>').join("") +
+    foreignCurs().map(c => (c === "USD" && BASE() !== "USD") ? usdRateItems() : '<label class="item"><span class="l"><span><b>Cotización del ' + esc(curInfo(c)[0].toLowerCase()) + '</b><small>' + curSym(BASE()) + ' por cada ' + curSym(c) + '. Se actualiza con tu último cambio de moneda.</small></span></span><input class="input rate-in" data-rate="' + c + '" inputmode="decimal" placeholder="Sin cargar" value="' + (rateOf(c) ? fmtIn(rateOf(c), 4) : "") + '"></label>').join("") +
     '<label class="item"><span class="l"><span><b>Mi mes empieza el día</b><small>Por ejemplo, el día que cobrás</small></span></span><select data-ch="monthStart">' + Array.from({length:28}, (_, i) => '<option value="' + (i + 1) + '"' + (+st.monthStart === i + 1 ? " selected" : "") + '>' + (i + 1) + '</option>').join("") + '</select></label>' +
     '<label class="item"><span class="l"><b>Apariencia</b></span><select data-ch="theme"><option value="auto"' + (prefs.theme === "auto" ? " selected" : "") + '>Automática</option><option value="light"' + (prefs.theme === "light" ? " selected" : "") + '>Clara</option><option value="dark"' + (prefs.theme === "dark" ? " selected" : "") + '>Oscura</option></select></label>' +
     '</div>';
@@ -1507,7 +1674,8 @@ function saveMov(){
   if (mov.type !== "transfer") { prefs.lastAcc = mov.acc; savePrefs(); }
   const edited = !!D.id;
   closeSheet(); render();
-  toast(edited ? "Cambios guardados" : (mov.type === "ingreso" ? "Ingreso registrado" : mov.type === "gasto" ? "Gasto registrado" : "Transferencia registrada"));
+  const bmsg = budgetMsg(mov);
+  toast(bmsg || (edited ? "Cambios guardados" : (mov.type === "ingreso" ? "Ingreso registrado" : mov.type === "gasto" ? "Gasto registrado" : "Transferencia registrada")));
 }
 
 /* cuotas que ya venías pagando */
@@ -1796,10 +1964,14 @@ function buildWorkbook(){
         T(q.n > 1 ? q.num + "/" + q.n : "1/1"), T(c), M(q.sign * q.amount)]));
     });
   });
-  const extra = cards().length ? [
+  const brsX = budgetRows();
+  const r7 = [[H("Categoría"), H("Tope mensual"), H("Gastado en el periodo"), H("Disponible"), H("Usado")]];
+  brsX.forEach(b => r7.push([T(b.c.name), M(b.tope), M(b.gastado), M(b.tope - b.gastado), {v:Math.round(b.usado * 10000) / 10000, s:4}]));
+  const extraB = brsX.length ? [{name:"Presupuestos", rows:r7, cols:[22, 16, 20, 16, 10], freeze:true}] : [];
+  const extra = (cards().length ? [
     {name:"Resúmenes de tarjeta", rows:r5, cols:[18, 16, 12, 13, 9, 16, 16, 16, 11], freeze:true},
     {name:"Cuotas a vencer", rows:r6, cols:[18, 16, 13, 30, 18, 8, 9, 16], freeze:true, filter:true}
-  ] : [];
+  ] : []).concat(extraB);
   return XLSX.build([
     {name:"Movimientos", rows:r1, cols:[12, 18, 30, 18, 18, 9, 16, 18, 10, 16, 12, 16, 22, 9], freeze:true, filter:true},
     {name:"Resumen mensual", rows:r2, cols:[18, 18, 18, 18, 16], freeze:true},
@@ -1944,6 +2116,10 @@ const A = {
   },
   "st-toggle": el => { const cv = cardView(accById(UI.card)); const cur = UI.stOpen || (cv.next ? cv.next.key : (cv.list[0] || {}).key); UI.stOpen = cur === el.dataset.v ? "_none" : el.dataset.v; render(); },
   "f-save-previo": () => savePrevio(),
+  "budgets": () => openBudgets(),
+  "f-save-budgets": () => saveBudgets(),
+  "budget-movs": el => { const c = catById(el.dataset.id); if (!c) return; UI.tab = "movs"; UI.movMode = "lista"; UI.movFilter = "gastos"; UI.movAcc = null; UI.movOffset = 0; UI.q = c.name; render(); window.scrollTo(0, 0); },
+  "hist-real": el => { UI.histReal = el.dataset.v === "1"; render(); },
   "goto-patrimonio": () => { UI.tab = "analisis"; UI.anTab = "patrimonio"; render(); window.scrollTo(0, 0); },
   "acc-value": el => openValueForm(el.dataset.id),
   "f-save-value": () => saveValue(),
@@ -1994,6 +2170,14 @@ document.addEventListener("change", e => {
   if (k === "currency") S.config.settings.currency = el.value;
   if (k === "monthStart") { S.config.settings.monthStart = +el.value; UI.movOffset = 0; UI.anOffset = 0; }
   if (k === "rapidoAcc") S.config.settings.rapidoAcc = el.value;
+  if (k === "dolarAuto") {
+    const prevLado = (S.config.settings.dolarAuto || {}).lado || "venta";
+    S.config.settings.dolarAuto = el.value === "manual" ? null : { casa:el.value, lado:prevLado };
+    persistConfig(); applyAutoRate(); render();
+    if (el.value !== "manual" && !autoQuote()) { if (syncCfg()) syncNow(); else fetchMarketDirect(true); }
+    return;
+  }
+  if (k === "dolarLado") { S.config.settings.dolarAuto = Object.assign({}, S.config.settings.dolarAuto, { lado:el.value }); persistConfig(); applyAutoRate(); render(); return; }
   persistConfig(); render();
 });
 document.addEventListener("keydown", e => {
