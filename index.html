@@ -293,6 +293,7 @@ button.item:active{background:var(--rule-2)}
 .reserve p{margin:10px 0 0;font-size:14px;font-weight:600}
 .stack{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--rule-2);margin-top:8px}
 .stack i{display:block;height:100%}
+.stack>i+i{margin-top:0}
 .bar.budget{position:relative;height:7px;margin-top:7px;overflow:visible}
 .bar.budget>i{border-radius:4px;max-width:100%}
 .bar.budget em{position:absolute;top:-3px;width:2px;height:13px;margin-left:-1px;background:var(--ink);opacity:.5;border-radius:1px}
@@ -336,6 +337,11 @@ button.sw{display:inline-block}
 .row.flash{animation:flash 1.8s ease-out}
 .txt-lg .wrap,.txt-lg .sheet-in{zoom:1.08}
 .txt-xl .wrap,.txt-xl .sheet-in{zoom:1.16}
+.ledger.flow::before{display:none}
+.flow .row{grid-template-columns:minmax(0,1fr) auto;padding-left:16px}
+.flow .stack{height:9px;margin-top:8px}
+.flow .meta{margin-top:2px}
+.share{margin:6px 0 0;font-size:15px}
 .loading{min-height:60vh;display:grid;place-items:center;color:var(--ink-2)}
 .toast{position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom,0px));transform:translate(-50%,20px);background:var(--ink);color:var(--paper);padding:10px 16px;border-radius:12px;font-size:14px;font-weight:500;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:60;max-width:calc(100% - 32px)}
 .toast.show{opacity:1;transform:translate(-50%,0)}
@@ -590,6 +596,28 @@ function ensureTwin(a){
     S.config.accounts.push(t); persistConfig();
   }
   return t;
+}
+function expectedIncome(){
+  const recs = S.config.recurrentes.filter(r => r.type === "ingreso" && accById(r.acc) && +r.amount > 0);
+  if (recs.length) return { v:sum(recs.map(r => toBase(+r.amount, accCur(r.acc)))), src:"rec", names:recs.map(r => r.concept || catName(r.cat)) };
+  let s = 0, n = 0;
+  for (let k = 1; k <= 3; k++) { const p = periodOf(new Date(), -k), l = movsBetween(p.start, p.end); if (!l.length) continue; s += totals(l).ing; n++; }
+  return n && s > 0 ? { v:s / n, src:"avg", n } : { v:0, src:null };
+}
+function fixedExpenses(){
+  const recs = S.config.recurrentes.filter(r => r.type === "gasto" && accById(r.acc) && !isCard(r.acc) && +r.amount > 0);
+  return { v:sum(recs.map(r => toBase(+r.amount, accCur(r.acc)))), names:recs.map(r => r.concept || catName(r.cat)) };
+}
+function cardFlow(n){
+  const now = new Date(), firstDue = primaryCards().map(a => mergedCard(a).next).filter(Boolean).map(x => x.s.due).sort((p, q) => p - q)[0];
+  const start = firstDue && firstDue > now ? firstDue : now, out = [];
+  for (let k = 0; k < n; k++) { const d = new Date(start.getFullYear(), start.getMonth() + k, 1); out.push({ y:d.getFullYear(), m:d.getMonth(), cards:0 }); }
+  primaryCards().forEach(a => mergedCard(a).list.forEach(x => {
+    const o = out.find(z => z.y === x.s.due.getFullYear() && z.m === x.s.due.getMonth()); if (!o) return;
+    o.cards += x.pendArs + toBase(x.pendUsd, "USD");
+  }));
+  out.forEach(o => o.cards = round2(o.cards));
+  return out;
 }
 function mergedCard(a){
   const t = twinOf(a), cv = cardView(a), tv = t ? cardView(t) : null, by = {};
@@ -1250,11 +1278,13 @@ function homeTarjetas(){
   const nxt = cs.map(a => mergedCard(a).next).filter(Boolean);
   let h = secHead("tarjetas", "Tarjetas", '<button class="link" data-a="goto-cards">Ver cuotas</button>', nxt.length ? '<small class="amt">' + money(sum(nxt.map(x => x.pendArs + toBase(x.pendUsd, "USD")))) + '</small>' : "");
   if (isFolded("tarjetas")) return h;
+  const incH = expectedIncome();
   return h + '<div class="ledger">' + cs.map(a => {
     const mc = mergedCard(a), nx = mc.next;
     return '<button class="row" data-a="open-card" data-id="' + esc(a.id) + '">' + accBadge(a) + '<span class="t"><b>' + esc(a.name) + '</b><span class="meta"><span>' +
       (nx ? "Resumen de " + esc(stmtName(nx.s)) + ", vence " + shortDate(nx.s.due) : "Sin pagos pendientes") + '</span></span></span><span class="r"><b class="amt">' + money(nx ? nx.pendArs : 0, false, accCur(a.id)) + '</b>' +
-      (nx && nx.pendUsd > 0.005 ? '<small class="amt">+ ' + money(nx.pendUsd, false, "USD") + '</small>' : mc.pendArs > (nx ? nx.pendArs : 0) + 0.5 ? '<small>Total en cuotas ' + money(mc.pendArs, false, accCur(a.id)) + '</small>' : "") + '</span></button>';
+      (nx && nx.pendUsd > 0.005 ? '<small class="amt">+ ' + money(nx.pendUsd, false, "USD") + '</small>' : "") +
+      (nx && incH.v > 0 ? '<small>' + pct((nx.pendArs + toBase(nx.pendUsd, "USD")) / incH.v) + ' de tus ingresos</small>' : "") + '</span></button>';
   }).join("") + '</div>';
 }
 function homeObjetivos(bal){
@@ -1608,13 +1638,19 @@ function viewTarjetas(){
   const a = accById(UI.card), cur = accCur(a.id), mc = mergedCard(a), hasUsd = !!mc.t;
   if (cs.length > 1) h += '<div class="chips" style="margin-bottom:10px">' + cs.map(c => '<button class="chip ' + (c.id === a.id ? "on" : "") + '" data-a="open-card" data-id="' + esc(c.id) + '">' + esc(c.name) + '</button>').join("") + '</div>';
 
-  h += '<div class="balance" style="margin-top:4px"><span class="muted">Pendiente en ' + esc(a.name) + '</span><div class="big amt">' + money(mc.pendArs, false, cur) + '</div>' +
-    (hasUsd && mc.pendUsd > 0.005 ? '<p class="amt" style="margin:-4px 0 8px;font-size:20px;font-weight:600">+ ' + money(mc.pendUsd, false, "USD") + '</p>' : "") +
-    '<p class="muted" style="margin:0;font-size:14px">Cierra el ' + (+a.cierre || 25) + ' y vence el ' + (+a.vence || 5) + ' de cada mes. <button class="link" data-a="edit-acc" data-id="' + esc(a.id) + '">Cambiar</button></p>' +
-    (mc.last && (mc.pendArs > 0.5 || mc.pendUsd > 0.005) ? '<p class="muted" style="margin:6px 0 0;font-size:14px">Con lo cargado hasta hoy, tus cuotas terminan en el resumen de ' + esc(stmtName(mc.last.s)) + '. Las suscripciones siguen todos los meses.</p>' : "") +
+  const nx = mc.next, inc = expectedIncome(), nxBase = nx ? nx.pendArs + toBase(nx.pendUsd, "USD") : 0;
+  h += '<div class="balance" style="margin-top:4px"><span class="muted">' + (nx ? "Próximo resumen de " + esc(stmtName(nx.s)) + ", vence el " + shortDate(nx.s.due) : "Sin pagos pendientes") + '</span>' +
+    '<div class="big amt">' + money(nx ? nx.pendArs : 0, false, cur) + '</div>' +
+    (nx && nx.pendUsd > 0.005 ? '<p class="amt" style="margin:-4px 0 8px;font-size:20px;font-weight:600">+ ' + money(nx.pendUsd, false, "USD") + '</p>' : "") +
+    (nx && inc.v > 0 ? '<p class="share">Es el <b>' + pct(nxBase / inc.v) + '</b> de tus ingresos del mes.</p>' : "") +
+    ((mc.pendArs > 0.5 || mc.pendUsd > 0.005) ? '<p class="muted" style="margin:8px 0 0;font-size:14px">Deuda total en cuotas: ' + money(mc.pendArs, false, cur) + (mc.pendUsd > 0.005 ? " + " + money(mc.pendUsd, false, "USD") : "") +
+      (mc.last ? ", repartida hasta el resumen de " + esc(stmtName(mc.last.s)) : "") + '.</p>' : "") +
+    '<p class="muted" style="margin:6px 0 0;font-size:14px">Cierra el ' + (+a.cierre || 25) + ' y vence el ' + (+a.vence || 5) + ' de cada mes. <button class="link" data-a="edit-acc" data-id="' + esc(a.id) + '">Cambiar</button></p>' +
     '<div class="btnrow"><button class="btn green small" data-a="card-buy">Nueva compra</button><button class="btn ghost small" data-a="card-sub">Nueva suscripción</button><button class="btn ghost small" data-a="card-previo">Cuotas que ya venías pagando</button></div></div>';
 
   if (!mc.list.length) return h + '<div class="empty" style="margin-top:14px"><p>Todavía no hay consumos ni cuotas en esta tarjeta. Empezá por las cuotas que ya venías pagando: las ves en tu último resumen, en “cuotas a vencer”.</p></div>';
+
+  h += flowSection(inc);
 
   const shown = mc.list.slice(0, 12), max = Math.max(1, ...shown.map(x => x.totalBase));
   const W_ = 340, H_ = 150, base = 118, gw = W_ / Math.max(6, shown.length);
@@ -1666,6 +1702,25 @@ function usdRateItems(){
   if (a && a.casa) h += '<label class="item"><span class="l"><span><b>Precio que usa</b><small>Venta es lo que pagás al comprar dólares</small></span></span><select data-ch="dolarLado"><option value="venta"' + (a.lado !== "compra" ? " selected" : "") + '>Venta</option><option value="compra"' + (a.lado === "compra" ? " selected" : "") + '>Compra</option></select></label>';
   else h += '<label class="item"><span class="l"><span><b>Dólar de referencia</b><small>' + curSym(BASE()) + ' por cada US$</small></span></span><input class="input rate-in" data-rate="USD" inputmode="decimal" placeholder="Sin cargar" value="' + (rateOf("USD") ? fmtIn(rateOf("USD"), 4) : "") + '"></label>';
   return h;
+}
+
+function flowSection(inc){
+  const rows = cardFlow(6);
+  if (!rows.some(o => o.cards > 0.5)) return "";
+  let h = '<div class="sec"><h2>Cuánto te comprometen</h2><small>' + (primaryCards().length > 1 ? "Todas tus tarjetas" : "Próximos meses") + '</small></div>';
+  if (!(inc.v > 0)) return h + '<div class="notice"><p>Para ver qué parte de tus ingresos se llevan las tarjetas, cargá tu sueldo con “Repetir cada mes”.</p></div>';
+  const fx = fixedExpenses();
+  h += '<div class="legend" style="padding:0 4px 8px"><span><i style="background:var(--red)"></i>Tarjetas</span>' + (fx.v > 0 ? '<span><i style="background:var(--gold)"></i>Gastos fijos</span>' : "") + '<span><i style="background:var(--green)"></i>Te queda</span></div>';
+  h += '<div class="ledger flow">' + rows.map(o => {
+    const used = o.cards + fx.v, libre = inc.v - used, den = Math.max(inc.v, used);
+    const w = v => (Math.max(0, v) / den * 100).toFixed(1) + "%";
+    return '<div class="row"><span class="t"><b>' + cap(MESES[o.m]) + (o.y !== new Date().getFullYear() ? " " + o.y : "") + '</b>' +
+      '<span class="meta"><span>Tarjetas ' + money(o.cards) + ', el ' + pct(o.cards / inc.v) + '</span></span>' +
+      '<span class="stack" style="display:flex"><i style="width:' + w(o.cards) + ';background:var(--red)"></i>' + (fx.v > 0 ? '<i style="width:' + w(fx.v) + ';background:var(--gold)"></i>' : "") + '<i style="width:' + w(libre) + ';background:var(--green)"></i></span></span>' +
+      '<span class="r"><b class="amt ' + (libre < 0 ? "neg" : "pos") + '">' + money(Math.abs(libre)) + '</b><small>' + (libre < 0 ? "te faltan" : "te quedan") + '</small></span></div>';
+  }).join("") + '</div>';
+  return h + '<p class="credit">Ingreso de referencia: ' + money(inc.v) + ' por mes, ' + (inc.src === "rec" ? "según tus ingresos mensuales (" + esc(inc.names.join(", ")) + ")" : "según el promedio de tus últimos " + inc.n + " meses") + '.' +
+    (fx.v > 0 ? ' Gastos fijos: ' + esc(fx.names.join(", ")) + '.' : "") + ' Lo que te queda es para el resto de tus gastos del mes.</p>';
 }
 
 /* ajustes */
