@@ -536,6 +536,26 @@ const catName = id => { const c = catById(id); return c ? c.name : "Sin categor�
 const catColor = id => { const c = catById(id); return c ? c.color : "#7D8794"; };
 const byDateDesc = (a, b) => (b.date + (b.created || 0)).localeCompare(a.date + (a.created || 0)) || ((b.created || 0) - (a.created || 0));
 
+const crit = () => S.config.settings.criterio === "devengado" ? "devengado" : "percibido";
+let CS_CACHE = {};
+/* Movimientos para estadísticas según el criterio elegido.
+   Devengado: cada gasto cuenta el día en que se hizo (una compra en cuotas, completa el día de la compra).
+   Percibido: lo pagado con tarjeta cuenta cuando vence el resumen en que se paga, cuota por cuota
+   (incluye las cuotas que venías pagando y los ajustes de resumen); lo demás, el día del movimiento. */
+function statMovs(start, end){
+  if (crit() === "devengado") return movsBetween(start, end);
+  const a = iso(start), b = iso(end);
+  const out = allMovs().filter(m => m.date >= a && m.date < b && !isCard(m.acc));
+  cards().forEach(c => cardStatements(c).forEach(st => {
+    const d = iso(st.s.due);
+    if (d < a || d >= b) return;
+    st.lines.forEach(q => {
+      if (q.proj || q.mov.type === "transfer") return;
+      out.push({ id:(q.mov.id || "") + "#" + q.num, type:q.sign > 0 ? "gasto" : "ingreso", amount:q.amount, acc:c.id, cat:q.mov.cat, date:d, concept:q.mov.concept, card:true });
+    });
+  }));
+  return out;
+}
 function movsBetween(start, end){
   const a = iso(start), b = iso(end);
   return allMovs().filter(m => m.date >= a && m.date < b);
@@ -601,7 +621,7 @@ function expectedIncome(){
   const recs = S.config.recurrentes.filter(r => r.type === "ingreso" && accById(r.acc) && +r.amount > 0);
   if (recs.length) return { v:sum(recs.map(r => toBase(+r.amount, accCur(r.acc)))), src:"rec", names:recs.map(r => r.concept || catName(r.cat)) };
   let s = 0, n = 0;
-  for (let k = 1; k <= 3; k++) { const p = periodOf(new Date(), -k), l = movsBetween(p.start, p.end); if (!l.length) continue; s += totals(l).ing; n++; }
+  for (let k = 1; k <= 3; k++) { const p = periodOf(new Date(), -k), l = statMovs(p.start, p.end); if (!l.length) continue; s += totals(l).ing; n++; }
   return n && s > 0 ? { v:s / n, src:"avg", n } : { v:0, src:null };
 }
 function fixedExpenses(){
@@ -661,6 +681,10 @@ function cuotasOf(mv, a){
   return out;
 }
 function cardStatements(a){
+  if (CS_CACHE[a.id]) return CS_CACHE[a.id];
+  const res = cardStatementsRaw(a); CS_CACHE[a.id] = res; return res;
+}
+function cardStatementsRaw(a){
   const map = {};
   const get = st => map[st.key] || (map[st.key] = { key:st.key, s:st, total:0, paid:0, lines:[] });
   allMovs().forEach(m => {
@@ -759,6 +783,7 @@ const STANDALONE = window.navigator.standalone === true || !!(window.matchMedia 
 function readLocal(){ try { const r = localStorage.getItem(DATA_KEY); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
 let saveFailed = false;
 function writeLocal(){
+  CS_CACHE = {};
   try { localStorage.setItem(DATA_KEY, JSON.stringify({v:2, config:S.config, months:S.months, tomb:S.tomb})); saveFailed = false; }
   catch (e) { if (!saveFailed) toast("No se pudo guardar. Liberá espacio en el teléfono y exportá una copia."); saveFailed = true; }
 }
@@ -896,7 +921,7 @@ function inflYear(inf){ const l = inf.s.slice(-12); return l.length === 12 ? l.r
 const hhmm = t => { const d = new Date(t); return pad(d.getHours()) + ":" + pad(d.getMinutes()); };
 
 /* ---------- presupuestos por categoría ---------- */
-function catSpentMap(p){ const by = {}; catBreakdown(movsBetween(p.start, p.end)).forEach(c => by[c.id] = c.total); return by; }
+function catSpentMap(p){ const by = {}; catBreakdown(statMovs(p.start, p.end)).forEach(c => by[c.id] = c.total); return by; }
 function budgetRows(){
   const p = periodOf(new Date()), spent = catSpentMap(p);
   return S.config.categories.filter(c => c.type === "gasto" && +c.tope > 0).map(c => { const g = spent[c.id] || 0; return { c, tope:+c.tope, gastado:g, usado:g / c.tope }; });
@@ -904,7 +929,7 @@ function budgetRows(){
 function avgSpent(catId, n){
   let s = 0, used = 0;
   for (let k = 1; k <= n; k++) {
-    const p = periodOf(new Date(), -k), list = movsBetween(p.start, p.end);
+    const p = periodOf(new Date(), -k), list = statMovs(p.start, p.end);
     if (!list.length) continue;
     used++;
     const b = catBreakdown(list).find(x => x.id === catId); s += b ? b.total : 0;
@@ -993,6 +1018,7 @@ function toDoc(){
     settings:S.config.settings, movs:allMovs(), tomb:S.tomb || {} };
 }
 function applyDoc(d){
+  CS_CACHE = {};
   const cfg = normalize({ accounts:d.accounts || [], categories:d.categories || [], recurrentes:d.recurrentes || [],
     settings: d.settings && Object.keys(d.settings).length ? d.settings : S.config.settings });
   const months = {};
@@ -1237,9 +1263,9 @@ function homeNotices(){
   return h;
 }
 function homeMes(){
-  const p = periodOf(new Date()), list = movsBetween(p.start, p.end), t = totals(list);
+  const p = periodOf(new Date()), list = statMovs(p.start, p.end), t = totals(list);
   const used = t.ing > 0 ? t.gas / t.ing : (t.gas > 0 ? 1 : 0);
-  let h = secHead("mes", "Tu mes", '<small>' + esc(periodLabel(p)) + '</small>', '<small class="amt ' + (t.net < 0 ? "neg" : "pos") + '">' + money(t.net, true) + '</small>');
+  let h = secHead("mes", "Tu mes", '<small>' + esc(periodLabel(p)) + (crit() === "percibido" ? ", percibido" : "") + '</small>', '<small class="amt ' + (t.net < 0 ? "neg" : "pos") + '">' + money(t.net, true) + '</small>');
   if (isFolded("mes")) return h;
   const fx = fxNote(list);
   return h + '<div class="month"><div class="io"><div class="kv"><span>Ingresos</span><b class="amt pos">' + money(t.ing) + '</b></div><div class="kv"><span>Gastos</span><b class="amt neg">' + money(t.gas) + '</b></div></div>' +
@@ -1393,7 +1419,7 @@ function rangeFor(kind, off){
 }
 function cumLine(p){
   const n = daysBetween(p.start, p.end), arr = new Array(n).fill(0);
-  movsBetween(p.start, p.end).forEach(m => { if (m.type !== "gasto" || m.previo) return; const i = daysBetween(p.start, fromISO(m.date)); if (i >= 0 && i < n) arr[i] += toBase(m.amount, accCur(m.acc)); });
+  statMovs(p.start, p.end).forEach(m => { if (m.type !== "gasto" || m.previo) return; const i = daysBetween(p.start, fromISO(m.date)); if (i >= 0 && i < n) arr[i] += toBase(m.amount, accCur(m.acc)); });
   let c = 0; return arr.map(v => (c += v));
 }
 function cumChart(r, prev, upto){
@@ -1448,9 +1474,14 @@ function deltaHtml(cur, prev, goodWhenDown){
   return '<span class="delta ' + (good ? "pos" : "neg") + '">' + (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(Math.round(d * 100)) + '%</span>';
 }
 
+function critChips(){
+  return '<div class="seg" style="margin-bottom:12px">' + [["percibido","Percibido"],["devengado","Devengado"]].map(x => '<button class="' + (crit() === x[0] ? "on" : "") + '" data-a="crit" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>' +
+    '<p class="credit" style="margin:-4px 2px 12px">' + (crit() === "percibido" ? "Lo pagado con tarjeta cuenta cuando vence el resumen, cuota por cuota." : "Las compras con tarjeta cuentan completas el día que comprás.") + '</p>';
+}
 function viewAnalisis(){
   let h = '<header class="top"><h1 class="title" style="margin:6px 0 4px">Análisis</h1>' + syncBadge() + '</header>';
   h += '<div class="seg" style="margin-bottom:14px">' + [["resumen","Resumen"],["historico","Histórico"],["comparar","Comparar"],["patrimonio","Patrimonio"]].map(x => '<button class="' + (UI.anTab === x[0] ? "on" : "") + '" data-a="an-tab" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>';
+  if (UI.anTab !== "patrimonio") h += critChips();
   if (UI.anTab === "resumen") h += anResumen();
   else if (UI.anTab === "historico") h += anHistorico();
   else if (UI.anTab === "patrimonio") h += anPatrimonio();
@@ -1464,13 +1495,13 @@ function anResumen(){
   const inProgress = today0 >= r.start && today0 < r.end;
   const total = daysBetween(r.start, r.end);
   const elapsed = inProgress ? daysBetween(r.start, today0) + 1 : total;
-  const list = movsBetween(r.start, inProgress ? addDays(today0, 1) : r.end);
-  const t = totals(movsBetween(r.start, r.end));
-  const prevList = inProgress ? movsBetween(prev.start, addDays(prev.start, elapsed)) : movsBetween(prev.start, prev.end);
+  const list = statMovs(r.start, inProgress ? addDays(today0, 1) : r.end);
+  const t = totals(statMovs(r.start, r.end));
+  const prevList = inProgress ? statMovs(prev.start, addDays(prev.start, elapsed)) : statMovs(prev.start, prev.end);
   const pt = totals(prevList);
   const daily = elapsed > 0 ? totals(list).gas / elapsed : 0;
   const rate = t.ing > 0 ? t.net / t.ing : NaN;
-  const cats = catBreakdown(movsBetween(r.start, r.end));
+  const cats = catBreakdown(statMovs(r.start, r.end));
   const maxCat = cats.length ? cats[0].total : 0;
 
   let h = '<div class="chips">' + [["mes","Mes"],["3m","3 meses"],["anio","Año"]].map(x => '<button class="chip ' + (UI.anRange === x[0] ? "on" : "") + '" data-a="an-range" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>';
@@ -1573,7 +1604,8 @@ function anHistorico(){
   const y = UI.histYear, inf = inflData(), real = UI.histReal && inflOn();
   const rows = [];
   for (let m = 0; m < 12; m++) {
-    const t = totals(movsBetween(new Date(y, m, 1), new Date(y, m + 1, 1))), f = real ? realFactor(y + "-" + pad(m + 1), inf) : 1;
+    const future = new Date(y, m, 1) > new Date();
+    const t = future ? { ing:0, gas:0, net:0 } : totals(statMovs(new Date(y, m, 1), new Date(y, m + 1, 1))), f = real ? realFactor(y + "-" + pad(m + 1), inf) : 1;
     rows.push({m, ing:round2(t.ing * f), gas:round2(t.gas * f), net:round2(t.net * f)});
   }
   const max = Math.max(1, ...rows.map(r => Math.max(r.ing, r.gas)));
@@ -1608,7 +1640,7 @@ function anComparar(){
   const n = UI.cmpDays, now = new Date();
   const end = addDays(new Date(now.getFullYear(), now.getMonth(), now.getDate()), 1);
   const start = addDays(end, -n), pstart = addDays(start, -n);
-  const cur = movsBetween(start, end), prev = movsBetween(pstart, start);
+  const cur = statMovs(start, end), prev = statMovs(pstart, start);
   const t = totals(cur), pt = totals(prev);
   const lab = (a, b) => { const l = addDays(b, -1); return a.getDate() + " " + MESES_C[a.getMonth()] + " – " + l.getDate() + " " + MESES_C[l.getMonth()]; };
   let h = '<div class="chips">' + [7, 14, 30].map(x => '<button class="chip ' + (n === x ? "on" : "") + '" data-a="cmp-days" data-v="' + x + '">' + x + ' días</button>').join("") + '</div>';
@@ -1764,6 +1796,11 @@ function viewAjustes(){
     '<span class="accrow">' + ACCENTS.map(x => '<button class="' + ((prefs.accent || "libro") === x[0] ? "on" : "") + '" style="background:' + x[2] + '" data-a="accent" data-v="' + x[0] + '" aria-label="' + esc(x[1]) + '"></button>').join("") + '</span></div>' +
     '<label class="item"><span class="l"><span><b>Tamaño de letra</b><small>Agranda textos y números</small></span></span><select data-ch="textSize"><option value="normal"' + (!prefs.textSize || prefs.textSize === "normal" ? " selected" : "") + '>Normal</option><option value="lg"' + (prefs.textSize === "lg" ? " selected" : "") + '>Grande</option><option value="xl"' + (prefs.textSize === "xl" ? " selected" : "") + '>Muy grande</option></select></label></div>';
 
+  h += '<div class="sec"><h2>Criterio de gastos</h2></div><div class="group">' + [["percibido","Percibido (financiero)","Lo pagado con tarjeta cuenta cuando vence el resumen, cuota por cuota, incluidas las cuotas que venías pagando. Es cuando sale la plata."],
+      ["devengado","Devengado (económico)","Las compras con tarjeta cuentan completas el día que comprás, aunque las pagues en cuotas."]].map(x =>
+    '<button class="item" data-a="crit" data-v="' + x[0] + '"><span class="l"><span><b>' + x[1] + '</b><small>' + x[2] + '</small></span></span><span class="sw ' + (crit() === x[0] ? "on" : "") + '"></span></button>').join("") +
+    '</div><p class="credit">Cambia “Tu mes”, Análisis, presupuestos y el Excel. Podés alternar cuando quieras desde Análisis.</p>';
+
   const ord = homeOrder();
   h += '<div class="sec"><h2>Pantalla de inicio</h2><small>Orden y qué se ve</small></div><div class="group">' + ord.map((id, i) => {
     const name = (HOME_BLOCKS.find(b => b[0] === id) || [id, id])[1], vis = !homeHidden(id);
@@ -1825,6 +1862,7 @@ function countUp(){
   });
 }
 function render(){
+  CS_CACHE = {};
   const v = $("#view");
   const act = document.activeElement, focusId = act && act.id === "q" ? "q" : null;
   const selS = focusId ? act.selectionStart : 0;
@@ -1981,7 +2019,7 @@ function cuotaInfo(){
   const when = "el resumen de " + stmtName(s) + ", que vence el " + shortDate(s.due);
   if (D.cuotas === "sub") return "Se carga sola todos los meses el día " + fromISO(date).getDate() + " y aparece en cada resumen" + (cur === "USD" ? " en dólares" : "") + ". La primera entra en " + when + ".";
   if (n === 1) return "Entra en " + when + (cur === "USD" ? ", en dólares" : "") + ".";
-  return (amt > 0 ? n + " cuotas de " + fmtNum(amt / n, cur) + ". " : "") + "La primera entra en " + when + ". En “Tu mes” cuenta el total el día de la compra.";
+  return (amt > 0 ? n + " cuotas de " + fmtNum(amt / n, cur) + ". " : "") + "La primera entra en " + when + "." + (crit() === "percibido" ? " Cada cuota cuenta como gasto del mes en que vence su resumen." : " En “Tu mes” cuenta el total el día de la compra.");
 }
 function formError(msg){ const e = $("#f-err"); if (e) e.textContent = msg; }
 
@@ -2102,7 +2140,7 @@ function previoInfo(){
 function previoForm(){
   const cats = S.config.categories.filter(c => c.type === "gasto");
   let h = sheetHead(D.id ? "Editar cuotas pendientes" : "Cuotas que ya venías pagando");
-  h += '<p class="muted" style="margin:0;font-size:14px">Para compras anteriores a la app. No suman como gasto de este mes: solo entran en la proyección y en la deuda de la tarjeta.</p>';
+  h += '<p class="muted" style="margin:0;font-size:14px">Para compras anteriores a la app. Con criterio percibido, cada cuota cuenta como gasto del mes en que la pagás. Con devengado no suman: solo entran en la proyección y en la deuda.</p>';
   h += '<div class="field"><label for="f-concept">Qué compraste</label><input id="f-concept" class="input" maxlength="80" placeholder="Por ejemplo, heladera" value="' + esc(D.concept) + '"></div>';
   h += '<div class="two"><div class="field"><label for="f-acc">Tarjeta</label><select id="f-acc" class="input">' + accOptions(D.acc, x => x.kind === "tarjeta") + '</select></div>' +
     '<div class="field"><label for="f-valor">Valor de cada cuota</label><input id="f-valor" class="input" inputmode="decimal" placeholder="0,00" value="' + esc(D.valorText) + '"></div></div>';
@@ -2341,14 +2379,20 @@ function buildWorkbook(){
       m.type === "cambio" ? {v:m.rate, s:3} : null, (m.type === "gasto" || m.type === "ingreso") && !m.previo ? M(toBase(signed, c)) : null, T(cuotaTxt(m)), T(m.rec ? "Sí" : "")]);
   });
 
-  const keys = Object.keys(S.months).filter(k => (S.months[k] || []).length).sort();
-  const r2 = [[H("Mes"), H("Ingresos (" + base + ")"), H("Gastos (" + base + ")"), H("Balance (" + base + ")"), H("Tasa de ahorro")]];
+  // meses según el criterio elegido (con percibido, también los meses en que vencen resúmenes)
+  const monthStat = {};
+  const ksSet = new Set(Object.keys(S.months).filter(k => (S.months[k] || []).length));
+  if (crit() === "percibido") cards().forEach(c => cardStatements(c).forEach(st => { if (st.lines.some(q => !q.proj)) ksSet.add(iso(st.s.due).slice(0, 7)); }));
+  const nowYM = iso(new Date()).slice(0, 7);
+  const keys = Array.from(ksSet).filter(k => k <= nowYM).sort();
+  keys.forEach(k => { const p = k.split("-").map(Number); monthStat[k] = statMovs(new Date(p[0], p[1] - 1, 1), new Date(p[0], p[1], 1)); });
+  const r2 = [[H("Mes (" + (crit() === "percibido" ? "percibido" : "devengado") + ")"), H("Ingresos (" + base + ")"), H("Gastos (" + base + ")"), H("Balance (" + base + ")"), H("Tasa de ahorro")]];
   let ti = 0, tg = 0;
-  keys.forEach(k => { const t = totals(S.months[k]); ti += t.ing; tg += t.gas; r2.push([{v:excelDate(k + "-01"), s:7}, M(t.ing), M(t.gas), M(t.net), t.ing ? {v:Math.round(t.net / t.ing * 10000) / 10000, s:4} : null]); });
+  keys.forEach(k => { const t = totals(monthStat[k]); ti += t.ing; tg += t.gas; r2.push([{v:excelDate(k + "-01"), s:7}, M(t.ing), M(t.gas), M(t.net), t.ing ? {v:Math.round(t.net / t.ing * 10000) / 10000, s:4} : null]); });
   if (keys.length) r2.push([{v:"Total", s:6}, MB(ti), MB(tg), MB(ti - tg), ti ? {v:Math.round((ti - tg) / ti * 10000) / 10000, s:8} : null]);
 
   const spent = {};
-  movs.filter(m => m.type === "gasto" && !m.previo).forEach(m => { const k = m.date.slice(0, 7), c = catById(m.cat) ? m.cat : "_none"; spent[c] = spent[c] || {}; spent[c][k] = (spent[c][k] || 0) + toBase(m.amount, accCur(m.acc)); });
+  keys.forEach(k => monthStat[k].filter(m => m.type === "gasto" && !m.previo).forEach(m => { const c = catById(m.cat) ? m.cat : "_none"; spent[c] = spent[c] || {}; spent[c][k] = (spent[c][k] || 0) + toBase(m.amount, accCur(m.acc)); }));
   const catIds = S.config.categories.filter(c => c.type === "gasto" && spent[c.id]).map(c => c.id).concat(spent._none ? ["_none"] : []);
   const r3 = [[H("Categoría (" + base + ")")].concat(keys.map(k => H(cap(MESES_C[+k.slice(5) - 1]) + " " + k.slice(0, 4))), [H("Total")])];
   catIds.forEach(id => { const row = [T(id === "_none" ? "Sin categoría" : catName(id))]; let tot = 0; keys.forEach(k => { const v = (spent[id] || {})[k] || 0; tot += v; row.push(v ? M(v) : null); }); row.push(MB(tot)); r3.push(row); });
@@ -2544,6 +2588,7 @@ const A = {
   },
   "st-toggle": el => { const cv = cardView(accById(UI.card)); const cur = UI.stOpen || (cv.next ? cv.next.key : (cv.list[0] || {}).key); UI.stOpen = cur === el.dataset.v ? "_none" : el.dataset.v; render(); },
   "f-save-previo": () => savePrevio(),
+  "crit": el => { S.config.settings.criterio = el.dataset.v === "percibido" ? "percibido" : "devengado"; persistConfig(); render(); toast(el.dataset.v === "percibido" ? "Criterio percibido" : "Criterio devengado"); },
   "fold": el => { const id = el.dataset.v, f = prefs.folded || []; prefs.folded = f.indexOf(id) >= 0 ? f.filter(x => x !== id) : f.concat([id]); savePrefs(); render(); },
   "home-move": el => { const o = homeOrder(), i = o.indexOf(el.dataset.v), j = i + (+el.dataset.d); if (i < 0 || j < 0 || j >= o.length) return; o.splice(j, 0, o.splice(i, 1)[0]); prefs.homeOrder = o; savePrefs(); render(); },
   "home-toggle": el => { const id = el.dataset.v, hd = prefs.homeHidden || []; prefs.homeHidden = hd.indexOf(id) >= 0 ? hd.filter(x => x !== id) : hd.concat([id]); savePrefs(); render(); },
