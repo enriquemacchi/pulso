@@ -342,6 +342,12 @@ button.sw{display:inline-block}
 .flow .stack{height:9px;margin-top:8px}
 .flow .meta{margin-top:2px}
 .share{margin:6px 0 0;font-size:15px}
+.seg.tabs{overflow-x:auto;scrollbar-width:none}
+.seg.tabs::-webkit-scrollbar{display:none}
+.seg.tabs{gap:2px}
+.seg.tabs button{flex:1 0 auto;padding:8px 4px;font-size:13px}
+@media (max-width:380px){.seg.tabs button{font-size:12px;padding:8px 3px}}
+.dest .row{grid-template-columns:30px minmax(0,1fr) auto}
 .loading{min-height:60vh;display:grid;place-items:center;color:var(--ink-2)}
 .toast{position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom,0px));transform:translate(-50%,20px);background:var(--ink);color:var(--paper);padding:10px 16px;border-radius:12px;font-size:14px;font-weight:500;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:60;max-width:calc(100% - 32px)}
 .toast.show{opacity:1;transform:translate(-50%,0)}
@@ -1480,11 +1486,12 @@ function critChips(){
 }
 function viewAnalisis(){
   let h = '<header class="top"><h1 class="title" style="margin:6px 0 4px">Análisis</h1>' + syncBadge() + '</header>';
-  h += '<div class="seg" style="margin-bottom:14px">' + [["resumen","Resumen"],["historico","Histórico"],["comparar","Comparar"],["patrimonio","Patrimonio"]].map(x => '<button class="' + (UI.anTab === x[0] ? "on" : "") + '" data-a="an-tab" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>';
+  h += '<div class="seg tabs" style="margin-bottom:14px">' + [["resumen","Resumen"],["ingresos","Ingresos"],["historico","Histórico"],["comparar","Comparar"],["patrimonio","Patrimonio"]].map(x => '<button class="' + (UI.anTab === x[0] ? "on" : "") + '" data-a="an-tab" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>';
   if (UI.anTab !== "patrimonio") h += critChips();
   if (UI.anTab === "resumen") h += anResumen();
   else if (UI.anTab === "historico") h += anHistorico();
   else if (UI.anTab === "patrimonio") h += anPatrimonio();
+  else if (UI.anTab === "ingresos") h += anIngresos();
   else h += anComparar();
   return h;
 }
@@ -1598,6 +1605,107 @@ function saveValue(){
   const cur = balances()[a.id] || 0;
   a.initial = round2((+a.initial || 0) + (v - cur)); a.valuado = iso(new Date());
   persistConfig(); closeSheet(); render(); toast("Valor actualizado");
+}
+
+function incBreakdown(list){
+  const by = {};
+  list.filter(m => m.type === "ingreso" && !m.previo && !m.card && !isCard(m.acc)).forEach(m => { const v = toBase(m.amount, accCur(m.acc)); const o = by[m.cat] || (by[m.cat] = { fijo:0, extra:0 }); if (m.rec) o.fijo += v; else o.extra += v; });
+  return Object.keys(by).map(k => ({ id:k, name:catName(k), color:catColor(k), total:round2(by[k].fijo + by[k].extra), fijo:round2(by[k].fijo), extra:round2(by[k].extra) })).sort((a, b) => b.total - a.total);
+}
+function incTotal(list){ return round2(sum(incBreakdown(list).map(c => c.total))); }
+function anIngresos(){
+  const r = rangeFor(UI.anRange, UI.anOffset), prev = rangeFor(UI.anRange, UI.anOffset - 1);
+  const now = new Date(), today0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const inProgress = today0 >= r.start && today0 < r.end;
+  const list = statMovs(r.start, r.end), cats = incBreakdown(list), ing = incTotal(list);
+  const pIng = incTotal(statMovs(prev.start, prev.end));
+  const fijo = round2(sum(cats.map(c => c.fijo))), extra = round2(sum(cats.map(c => c.extra)));
+  const inf = inflData();
+
+  let h = '<div class="chips">' + [["mes","Mes"],["3m","3 meses"],["anio","Año"]].map(x => '<button class="chip ' + (UI.anRange === x[0] ? "on" : "") + '" data-a="an-range" data-v="' + x[0] + '">' + x[1] + '</button>').join("") + '</div>';
+  h += '<div class="nav" style="margin-top:10px"><button class="iconbtn" data-a="an-prev" aria-label="Anterior">' + ic("left") + '</button><b>' + esc(r.label) + '</b><button class="iconbtn" data-a="an-next" aria-label="Siguiente">' + ic("right") + '</button></div>';
+  if (!(ing > 0)) return h + '<div class="empty"><p>No hay ingresos registrados en este periodo.' + (inProgress ? " Si ya cobraste, cargá tu sueldo con “Repetir cada mes” para que se registre solo." : "") + '</p></div>';
+
+  // variación nominal y real
+  let realTxt = "", d = null, real = null, infR = null;
+  if (pIng > 0) {
+    d = (ing - pIng) / pIng;
+    if (inflOn()) {
+      if (UI.anRange === "mes") infR = inf.last[1] / 100;
+      else { const n = UI.anRange === "3m" ? 3 : 12, l = inf.s.slice(-n); if (l.length === n) infR = l.reduce((a, x) => a * (1 + x[1] / 100), 1) - 1; }
+      if (infR != null) real = (1 + d) / (1 + infR) - 1;
+    }
+  }
+  const usd = BASE() === "ARS" && rateOf("USD") ? ing / rateOf("USD") : null;
+  const sp = x => { const r = Math.round(x * 100); return (r > 0 ? "+" : r < 0 ? "−" : "") + Math.abs(r) + "%"; };
+  const tone = x => Math.round(x * 100) > 0 ? "pos" : Math.round(x * 100) < 0 ? "neg" : "";
+  h += '<div class="balance"><span class="muted">Ingresos del periodo' + (inProgress ? ", hasta hoy" : "") + '</span><div class="big amt pos">' + money(ing) + '</div>' +
+    '<div class="io" style="margin:0"><div class="kv"><span>Frente al anterior</span><b class="' + (d == null ? "" : tone(d)) + '">' + (d == null ? "—" : sp(d)) + '</b></div>' +
+    '<div class="kv"><span>' + (real != null ? "En términos reales" : "En dólares") + '</span><b class="' + (real == null ? "" : tone(real)) + '">' + (real != null ? sp(real) : usd != null ? money(usd, false, "USD") : "—") + '</b></div></div></div>';
+
+  // métricas
+  const avgN = [1, 2, 3, 4, 5, 6].map(k => { const p = periodOf(new Date(), -k); return incTotal(statMovs(p.start, p.end)); }).filter(v => v > 0);
+  const avg6 = avgN.length ? sum(avgN) / avgN.length : null;
+  h += '<div class="metrics">' +
+    '<div class="metric"><span>Fijos</span><b class="amt">' + money(fijo) + '</b><small>' + pct(fijo / ing) + ' del total, lo que cobrás todos los meses</small></div>' +
+    '<div class="metric"><span>Extraordinarios</span><b class="amt">' + money(extra) + '</b><small>' + pct(extra / ing) + ' del total, ingresos puntuales</small></div>' +
+    (usd != null && real != null ? '<div class="metric"><span>En dólares</span><b class="amt">' + money(usd, false, "USD") + '</b><small>Al dólar de referencia de hoy</small></div>' : "") +
+    (avg6 != null && UI.anRange === "mes" ? '<div class="metric"><span>Promedio mensual</span><b class="amt">' + money(avg6) + '</b><small>De tus ' + (avgN.length === 1 ? "último mes" : "últimos " + avgN.length + " meses") + ' con ingresos</small></div>' : "") +
+    '</div>';
+
+  // a dónde fueron tus ingresos
+  const gList = list.filter(m => m.type === "gasto" && !m.previo);
+  let gFix = 0, gCard = 0, gOtro = 0;
+  gList.forEach(m => { const v = toBase(m.amount, accCur(m.acc)); if (m.card || isCard(m.acc)) gCard += v; else if (m.rec) gFix += v; else gOtro += v; });
+  const gTot = gFix + gCard + gOtro, ahorro = ing - gTot, den = Math.max(ing, gTot);
+  const parts = [["Gastos fijos", gFix, "var(--gold)", "repeat"], ["Tarjetas", gCard, "var(--red)", "card"], ["Resto de los gastos", gOtro, "#2F6F8F", "bag"], [ahorro >= 0 ? "Ahorro" : "Gastaste de más", Math.abs(ahorro), ahorro >= 0 ? "var(--green)" : "var(--red)", ahorro >= 0 ? "trend" : "x"]];
+  h += '<div class="sec"><h2>A dónde fueron tus ingresos</h2><small>' + (crit() === "percibido" ? "Percibido" : "Devengado") + '</small></div>';
+  h += '<div class="chart" style="padding:14px 16px"><div class="stack" style="height:12px;margin:0 0 10px">' + parts.filter(x => x[1] > 0.5 && (x[0] !== "Gastaste de más")).map(x => '<i style="width:' + (x[1] / den * 100).toFixed(2) + '%;background:' + x[2] + '"></i>').join("") + '</div>' +
+    '<p class="muted" style="margin:0;font-size:14px">' + (ahorro >= 0 ? "De cada $ 100 que ingresaron, ahorraste <b>$ " + Math.round(ahorro / ing * 100) + "</b>." : "Gastaste " + esc(money(-ahorro)) + " más de lo que ingresó en el periodo.") + '</p></div>';
+  h += '<div class="ledger dest">' + parts.filter(x => x[1] > 0.5).map(x => '<div class="row"><span class="cico" style="--c:' + x[2] + '">' + ic(x[3], 17) + '</span><span class="t"><b>' + x[0] + '</b></span><span class="r"><b class="amt">' + money(x[1]) + '</b><small>' + pct(x[1] / ing) + ' de tus ingresos</small></span></div>').join("") + '</div>';
+
+  // de dónde vienen
+  h += '<div class="sec"><h2>De dónde vienen</h2></div>' + (cats.length > 1 ? donutChart(cats, ing).replace(">Gastos<", ">Ingresos<") : "") +
+    '<div class="ledger cats">' + cats.map(c => '<div class="row">' + catBadge(c.id) + '<span class="t"><b>' + esc(c.name) + '</b><span class="meta">' + (c.fijo > 0.5 ? '<span>Fijo ' + money(c.fijo) + '</span>' : "") + (c.extra > 0.5 ? '<span>Puntual ' + money(c.extra) + '</span>' : "") + '</span></span>' +
+      '<span class="r"><b class="amt pos">' + money(c.total) + '</b><small>' + pct(c.total / ing) + '</small></span></div>').join("") + '</div>';
+
+  // evolución de los últimos 12 meses
+  const real12 = UI.incReal && inflOn(), months = [];
+  for (let k = 11; k >= 0; k--) {
+    const b = new Date(now.getFullYear(), now.getMonth() - k, 1), ym = iso(b).slice(0, 7);
+    const v = incTotal(statMovs(b, new Date(b.getFullYear(), b.getMonth() + 1, 1)));
+    months.push({ b, ym, v:round2(v * (real12 ? realFactor(ym, inf) : 1)) });
+  }
+  const withData = months.filter(x => x.v > 0);
+  if (withData.length >= 2) {
+    const max = Math.max(...months.map(x => x.v)), avg = sum(withData.map(x => x.v)) / withData.length;
+    const W_ = 340, H_ = 150, base = 118, gw = W_ / 12;
+    let svg = '<svg viewBox="0 0 ' + W_ + ' ' + H_ + '" width="100%" role="img" aria-label="Ingresos de los últimos 12 meses">';
+    const ya = base - avg / max * 96;
+    months.forEach((x, i) => {
+      const cx = i * gw + gw / 2, bw = Math.min(16, gw * 0.55), hh = x.v / max * 96;
+      if (hh > 0) svg += '<rect x="' + (cx - bw / 2).toFixed(1) + '" y="' + (base - hh).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + hh.toFixed(1) + '" rx="3" fill="var(--green)"' + (i === 11 && inProgress && UI.anOffset === 0 ? ' opacity=".55"' : "") + '/>';
+      svg += '<text x="' + cx.toFixed(1) + '" y="' + (base + 16) + '" text-anchor="middle" font-size="11" fill="var(--ink-3)" font-family="inherit">' + MESES[x.b.getMonth()].charAt(0).toUpperCase() + '</text>';
+    });
+    svg += '<line x1="0" x2="' + W_ + '" y1="' + ya.toFixed(1) + '" y2="' + ya.toFixed(1) + '" stroke="var(--ink-2)" stroke-dasharray="4 4"/>';
+    svg += '<line x1="0" x2="' + W_ + '" y1="' + base + '" y2="' + base + '" stroke="var(--rule)"/></svg>';
+    h += '<div class="sec"><h2>Evolución</h2><small>Últimos 12 meses</small></div>';
+    if (inflOn()) h += '<div class="chips" style="margin-bottom:10px"><button class="chip ' + (!real12 ? "on" : "") + '" data-a="inc-real" data-v="0">En pesos de cada mes</button><button class="chip ' + (real12 ? "on" : "") + '" data-a="inc-real" data-v="1">Sin inflación</button></div>';
+    h += '<div class="chart"><div class="legend"><span><i style="background:var(--green)"></i>Ingresos</span><span><i style="background:var(--ink-2)"></i>Promedio ' + money(avg) + '</span></div>' + svg + '</div>';
+    if (real12) h += '<p class="credit">Montos llevados a pesos de ' + esc(ymName(inf.last[0])) + ' con el IPC del INDEC.</p>';
+  }
+
+  // lo importante
+  const lines = [];
+  if (d != null) lines.push(Math.round(d * 100) === 0 ? "Ingresaste " + money(ing) + ", prácticamente lo mismo que en el periodo anterior" + (inProgress ? " (hasta hoy)" : "") + "." :
+    "Ingresaste " + money(ing) + ", un " + Math.abs(Math.round(d * 100)) + "% " + (d > 0 ? "más" : "menos") + " que en el periodo anterior" + (inProgress ? " (hasta hoy)" : "") + ".");
+  if (real != null) { const infTxt = "Descontando la inflación" + (UI.anRange === "mes" ? " de " + ymName(inf.last[0]) : " del periodo") + " (" + String(Math.round(infR * 1000) / 10).replace(".", ",") + "%), ";
+    lines.push(infTxt + (Math.round(real * 100) === 0 ? "tus ingresos se mantuvieron en términos reales: le empataste a la inflación." : "tus ingresos " + (real > 0 ? "subieron" : "bajaron") + " un " + Math.abs(Math.round(real * 100)) + "% en términos reales" + (real > 0 ? ": le ganaste a la inflación." : ": perdiste contra la inflación."))); }
+  if (cats.length) lines.push(cats[0].name + " representa el " + pct(cats[0].total / ing) + " de tus ingresos" + (extra > 0.5 ? "; los ingresos puntuales sumaron " + money(extra) : "") + ".");
+  if (avg6 != null && UI.anRange === "mes" && !inProgress) { const dv = (ing - avg6) / avg6; if (Math.abs(dv) >= 0.05) lines.push("Este mes estuvo un " + Math.abs(Math.round(dv * 100)) + "% " + (dv > 0 ? "por encima" : "por debajo") + " de tu promedio."); }
+  if (ahorro >= 0 && ing > 0) lines.push("Te quedó el " + pct(ahorro / ing) + " de lo que ingresó después de todos los gastos.");
+  if (lines.length) h += '<div class="sec"><h2>Lo importante</h2></div><div class="reading">' + lines.map(l => "<p>" + esc(l) + "</p>").join("") + '</div>';
+  return h;
 }
 
 function anHistorico(){
@@ -2398,6 +2506,13 @@ function buildWorkbook(){
   catIds.forEach(id => { const row = [T(id === "_none" ? "Sin categoría" : catName(id))]; let tot = 0; keys.forEach(k => { const v = (spent[id] || {})[k] || 0; tot += v; row.push(v ? M(v) : null); }); row.push(MB(tot)); r3.push(row); });
   if (catIds.length) { const row = [{v:"Total", s:6}]; let all = 0; keys.forEach(k => { const v = sum(catIds.map(id => (spent[id] || {})[k] || 0)); all += v; row.push(MB(v)); }); row.push(MB(all)); r3.push(row); }
 
+  const incSp = {};
+  keys.forEach(k => monthStat[k].filter(m => m.type === "ingreso" && !m.card && !isCard(m.acc)).forEach(m => { const c = catById(m.cat) ? m.cat : "_none"; incSp[c] = incSp[c] || {}; incSp[c][k] = (incSp[c][k] || 0) + toBase(m.amount, accCur(m.acc)); }));
+  const incIds = S.config.categories.filter(c => c.type === "ingreso" && incSp[c.id]).map(c => c.id).concat(incSp._none ? ["_none"] : []);
+  const r8 = [[H("Categoría (" + base + ")")].concat(keys.map(k => H(cap(MESES_C[+k.slice(5) - 1]) + " " + k.slice(0, 4))), [H("Total")])];
+  incIds.forEach(id => { const row = [T(id === "_none" ? "Sin categoría" : catName(id))]; let tot = 0; keys.forEach(k => { const v = (incSp[id] || {})[k] || 0; tot += v; row.push(v ? M(v) : null); }); row.push(MB(tot)); r8.push(row); });
+  if (incIds.length) { const row = [{v:"Total", s:6}]; let all = 0; keys.forEach(k => { const v = sum(incIds.map(id => (incSp[id] || {})[k] || 0)); all += v; row.push(MB(v)); }); row.push(MB(all)); r8.push(row); }
+
   const bal = balances();
   const r4 = [[H("Cuenta"), H("Tipo"), H("Moneda"), H("Saldo inicial"), H("Saldo actual"), H("Saldo en " + base), H("Meta"), H("Avance")]];
   S.config.accounts.forEach(a => r4.push([T(a.name), T(KINDS[a.kind] || "Cuenta"), T(a.currency || base), M(+a.initial || 0), M(bal[a.id] || 0), M(toBase(bal[a.id] || 0, a.currency)),
@@ -2428,6 +2543,7 @@ function buildWorkbook(){
   return XLSX.build([
     {name:"Movimientos", rows:r1, cols:[12, 18, 30, 18, 18, 9, 16, 18, 10, 16, 12, 16, 22, 9], freeze:true, filter:true},
     {name:"Resumen mensual", rows:r2, cols:[18, 18, 18, 18, 16], freeze:true},
+    {name:"Ingresos por categoría", rows:r8, cols:[22].concat(keys.map(() => 15), [17]), freeze:true},
     {name:"Gastos por categoría", rows:r3, cols:[24].concat(keys.map(() => 15), [17]), freeze:true},
     {name:"Cuentas", rows:r4, cols:[22, 14, 9, 16, 16, 18, 16, 10], freeze:true}
   ].concat(extra));
@@ -2597,6 +2713,7 @@ const A = {
   "budgets": () => openBudgets(),
   "f-save-budgets": () => saveBudgets(),
   "budget-movs": el => { const c = catById(el.dataset.id); if (!c) return; UI.tab = "movs"; UI.movMode = "lista"; UI.movFilter = "gastos"; UI.movAcc = null; UI.movOffset = 0; UI.q = c.name; render(); window.scrollTo(0, 0); },
+  "inc-real": el => { UI.incReal = el.dataset.v === "1"; render(); },
   "hist-real": el => { UI.histReal = el.dataset.v === "1"; render(); },
   "goto-patrimonio": () => { UI.tab = "analisis"; UI.anTab = "patrimonio"; render(); window.scrollTo(0, 0); },
   "acc-value": el => openValueForm(el.dataset.id),
